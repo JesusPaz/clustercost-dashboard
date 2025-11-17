@@ -187,13 +187,19 @@ export interface AgentStatusResponse {
   version?: string;
   updateAvailable: boolean;
   clusterName?: string;
+  clusterType?: string;
+  clusterRegion?: string;
   region?: string;
   nodeCount?: number;
 }
 
 export interface HealthResponse {
   status: string;
+  clusterId?: string;
   clusterName?: string;
+  clusterType?: string;
+  clusterRegion?: string;
+  version?: string;
   timestamp: string;
 }
 

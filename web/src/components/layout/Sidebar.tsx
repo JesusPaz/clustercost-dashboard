@@ -15,8 +15,7 @@ const Sidebar = () => {
   return (
     <aside className="flex h-full w-64 flex-col border-r border-border bg-background/90">
       <div className="flex items-center gap-2 px-6 py-5 text-lg font-semibold">
-        <span className="text-primary">ClusterCost</span>
-        <span className="rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">Dashboard</span>
+        <span className="text-primary">💸 ClusterCost</span>
       </div>
       <nav className="flex-1 space-y-1 px-2">
         {navItems.map(({ to, label, icon: Icon }) => (

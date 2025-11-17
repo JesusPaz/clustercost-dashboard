@@ -4,11 +4,13 @@ import "time"
 
 // HealthResponse represents the payload returned by the agent health endpoint.
 type HealthResponse struct {
-	Status    string    `json:"status"`
-	ClusterID string    `json:"clusterId"`
-	Timestamp time.Time `json:"timestamp"`
-	Version   string    `json:"version,omitempty"`
-	Region    string    `json:"region,omitempty"`
+	Status      string    `json:"status"`
+	ClusterID   string    `json:"clusterId"`
+	ClusterName string    `json:"clusterName,omitempty"`
+	ClusterType string    `json:"clusterType,omitempty"`
+	Timestamp   time.Time `json:"timestamp"`
+	Version     string    `json:"version,omitempty"`
+	Region      string    `json:"clusterRegion,omitempty"`
 }
 
 // NamespacesResponse contains namespace level cost data plus metadata.

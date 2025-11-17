@@ -9,7 +9,8 @@ import (
 
 // Health returns a simple readiness payload.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-	clusterName, timestamp, err := h.store.ClusterMetadata()
+	meta, err := h.store.ClusterMetadata()
+	timestamp := meta.Timestamp
 	status := "ok"
 
 	switch err {
@@ -36,8 +37,12 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      status,
-		"clusterName": clusterName,
-		"timestamp":   timestamp,
+		"status":        status,
+		"clusterId":     meta.ID,
+		"clusterName":   meta.Name,
+		"clusterType":   meta.Type,
+		"clusterRegion": meta.Region,
+		"version":       meta.Version,
+		"timestamp":     timestamp,
 	})
 }

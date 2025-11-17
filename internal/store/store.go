@@ -158,8 +158,19 @@ type AgentStatusPayload struct {
 	Version         string             `json:"version,omitempty"`
 	UpdateAvailable bool               `json:"updateAvailable"`
 	ClusterName     string             `json:"clusterName,omitempty"`
-	Region          string             `json:"region,omitempty"`
+	ClusterType     string             `json:"clusterType,omitempty"`
+	ClusterRegion   string             `json:"clusterRegion,omitempty"`
 	NodeCount       int                `json:"nodeCount"`
+}
+
+// ClusterMetadata captures the latest cluster identity details known to the dashboard.
+type ClusterMetadata struct {
+	ID        string
+	Name      string
+	Type      string
+	Region    string
+	Version   string
+	Timestamp time.Time
 }
 
 // AgentInfo is exposed on /api/agents and referenced by health.
@@ -529,8 +540,9 @@ func (s *Store) AgentStatus() (AgentStatusPayload, error) {
 		Datasets:        datasets,
 		Version:         version,
 		UpdateAvailable: updateAvailable,
-		ClusterName:     meta.ClusterID,
-		Region:          meta.Region,
+		ClusterName:     meta.ClusterName,
+		ClusterType:     meta.ClusterType,
+		ClusterRegion:   meta.Region,
 		NodeCount:       nodeCount,
 	}, nil
 }
@@ -567,8 +579,8 @@ func (s *Store) Agents() []AgentInfo {
 	return result
 }
 
-// ClusterMetadata returns the known cluster name and latest timestamp.
-func (s *Store) ClusterMetadata() (string, time.Time, error) {
+// ClusterMetadata returns the known cluster metadata and latest timestamp.
+func (s *Store) ClusterMetadata() (ClusterMetadata, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -580,10 +592,27 @@ func (s *Store) ClusterMetadata() (string, time.Time, error) {
 	if ts.IsZero() {
 		ts = s.latestScrapeLocked()
 	}
-	if ts.IsZero() {
-		return meta.ClusterID, time.Time{}, ErrNoData
+
+	if meta.ClusterName == "" {
+		meta.ClusterName = meta.ClusterID
 	}
-	return meta.ClusterID, ts, nil
+	if meta.ClusterType == "" {
+		meta.ClusterType = meta.ClusterID
+	}
+
+	cluster := ClusterMetadata{
+		ID:        meta.ClusterID,
+		Name:      meta.ClusterName,
+		Type:      meta.ClusterType,
+		Region:    meta.Region,
+		Version:   meta.Version,
+		Timestamp: ts,
+	}
+
+	if ts.IsZero() {
+		return cluster, ErrNoData
+	}
+	return cluster, nil
 }
 
 func (s *Store) latestScrapeLocked() time.Time {
@@ -600,10 +629,12 @@ func (s *Store) latestScrapeLocked() time.Time {
 }
 
 type agentMetadata struct {
-	ClusterID string
-	Region    string
-	Version   string
-	Timestamp time.Time
+	ClusterID   string
+	ClusterName string
+	ClusterType string
+	Region      string
+	Version     string
+	Timestamp   time.Time
 }
 
 func (s *Store) latestAgentMetadataLocked() agentMetadata {
@@ -616,14 +647,22 @@ func (s *Store) latestAgentMetadataLocked() agentMetadata {
 		if ts.IsZero() {
 			ts = snap.LastScrape
 		}
-		if ts.After(meta.Timestamp) {
+		if meta.Timestamp.IsZero() || ts.After(meta.Timestamp) {
 			meta = agentMetadata{
-				ClusterID: snap.Health.ClusterID,
-				Region:    snap.Health.Region,
-				Version:   snap.Health.Version,
-				Timestamp: ts,
+				ClusterID:   snap.Health.ClusterID,
+				ClusterName: snap.Health.ClusterName,
+				ClusterType: snap.Health.ClusterType,
+				Region:      snap.Health.Region,
+				Version:     snap.Health.Version,
+				Timestamp:   ts,
 			}
 		}
+	}
+	if meta.ClusterName == "" {
+		meta.ClusterName = meta.ClusterID
+	}
+	if meta.ClusterType == "" {
+		meta.ClusterType = meta.ClusterID
 	}
 	return meta
 }

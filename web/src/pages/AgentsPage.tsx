@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { fetchAgentStatus, type AgentDatasetStatus, type AgentStatusResponse } from "../lib/api";
+import { fetchAgentStatus, fetchHealth, type AgentDatasetStatus, type AgentStatusResponse } from "../lib/api";
 import { useApiData } from "../hooks/useApiData";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -41,18 +41,34 @@ const datasetTone: Record<AgentDatasetStatus, { label: string; className: string
 
 const AgentsPage = () => {
   const { data, loading, error, refresh } = useApiData(fetchAgentStatus);
+  const {
+    data: health,
+    refresh: refreshHealth
+  } = useApiData(fetchHealth);
   const statusDetails = data ? statusConfig[data.status] : null;
   const lastSyncLabel = data?.lastSync ? relativeTimeFromIso(data.lastSync) : "Unknown";
 
   const clusterMeta = useMemo(() => {
-    if (!data) return null;
-    if (!data.clusterName && !data.region && !data.nodeCount) return null;
+    const clusterName = data?.clusterName || health?.clusterName || health?.clusterId;
+    const clusterType = data?.clusterType || health?.clusterType;
+    const region = data?.clusterRegion || data?.region || health?.clusterRegion;
+    const nodeCount = typeof data?.nodeCount === "number" ? data?.nodeCount : undefined;
+
+    const hasMetadata = clusterName || clusterType || region || typeof nodeCount === "number";
+    if (!hasMetadata) return null;
+
     return {
-      clusterName: data.clusterName || "Unknown",
-      region: data.region || "Unknown",
-      nodeCount: typeof data.nodeCount === "number" ? data.nodeCount : undefined
+      clusterName: clusterName || "Unknown",
+      clusterType: clusterType || (clusterName ? "Unknown" : undefined),
+      region: region || "Unknown",
+      nodeCount
     };
-  }, [data]);
+  }, [data, health]);
+
+  const handleRefresh = () => {
+    refresh();
+    refreshHealth();
+  };
 
   if (loading && !data) {
     return <Skeleton className="h-[60vh] w-full" />;
@@ -74,7 +90,7 @@ const AgentsPage = () => {
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground space-y-3">
           <p>The dashboard hasn\'t received any metrics from your agent yet.</p>
-          <Button variant="outline" onClick={refresh}>Refresh</Button>
+          <Button variant="outline" onClick={handleRefresh}>Refresh</Button>
         </CardContent>
       </Card>
     );
@@ -87,7 +103,7 @@ const AgentsPage = () => {
           <h1 className="text-2xl font-semibold">Agent</h1>
           <p className="text-sm text-muted-foreground">Agent connection and data health</p>
         </div>
-        <Button variant="outline" onClick={refresh} disabled={loading}>
+        <Button variant="outline" onClick={handleRefresh} disabled={loading}>
           {loading ? "Refreshing…" : "Refresh"}
         </Button>
       </header>
@@ -141,11 +157,17 @@ const AgentsPage = () => {
           <CardHeader>
             <CardTitle>Cluster metadata</CardTitle>
           </CardHeader>
-          <CardContent className="grid gap-4 text-sm text-muted-foreground md:grid-cols-3">
+          <CardContent className="grid gap-4 text-sm text-muted-foreground md:grid-cols-4">
             <div>
               <p className="text-xs uppercase">Cluster</p>
               <p className="text-base text-foreground">{clusterMeta.clusterName}</p>
             </div>
+            {clusterMeta.clusterType && (
+              <div>
+                <p className="text-xs uppercase">Type</p>
+                <p className="text-base text-foreground">{clusterMeta.clusterType}</p>
+              </div>
+            )}
             <div>
               <p className="text-xs uppercase">Region</p>
               <p className="text-base text-foreground">{clusterMeta.region}</p>
