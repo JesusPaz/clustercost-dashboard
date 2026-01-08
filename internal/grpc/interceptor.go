@@ -35,8 +35,8 @@ func NewAuthInterceptor(agents []config.AgentConfig, defaultToken string) *AuthI
 func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		if len(i.validTokens) == 0 && i.defaultToken == "" {
-			// If no tokens are configured, deny.
-			return nil, status.Error(codes.Unauthenticated, "no auth tokens configured")
+			// If no tokens are configured, allow unauthenticated access.
+			return handler(ctx, req)
 		}
 
 		md, ok := metadata.FromIncomingContext(ctx)

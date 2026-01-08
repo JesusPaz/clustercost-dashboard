@@ -6,6 +6,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/clustercost/clustercost-dashboard/internal/store"
+	"github.com/clustercost/clustercost-dashboard/internal/vm"
 )
 
 const (
@@ -16,6 +17,7 @@ const (
 // Namespaces exposes namespace level cost metrics with filtering and pagination.
 func (h *Handler) Namespaces(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	ctx := vm.WithClusterID(r.Context(), clusterIDFromRequest(r))
 
 	filter := store.NamespaceFilter{
 		Environment: q.Get("environment"),
@@ -24,9 +26,9 @@ func (h *Handler) Namespaces(w http.ResponseWriter, r *http.Request) {
 		Offset:      parseOffset(q.Get("offset")),
 	}
 
-	resp, err := h.store.NamespaceList(filter)
+	resp, err := h.vm.NamespaceList(ctx, filter)
 	if err != nil {
-		if err == store.ErrNoData {
+		if err == vm.ErrNoData {
 			writeError(w, http.StatusServiceUnavailable, "data not yet available")
 			return
 		}
@@ -45,9 +47,10 @@ func (h *Handler) NamespaceDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ns, err := h.store.NamespaceDetail(name)
+	ctx := vm.WithClusterID(r.Context(), clusterIDFromRequest(r))
+	ns, err := h.vm.NamespaceDetail(ctx, name)
 	if err != nil {
-		if err == store.ErrNoData {
+		if err == vm.ErrNoData {
 			writeError(w, http.StatusNotFound, "namespace not found")
 			return
 		}

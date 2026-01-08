@@ -1,6 +1,9 @@
 package api
 
-import "strconv"
+import (
+	"net/http"
+	"strconv"
+)
 
 func parseLimit(raw string, fallback, max int) int {
 	limit := fallback
@@ -24,4 +27,11 @@ func parseOffset(raw string) int {
 		return 0
 	}
 	return parsed
+}
+
+func clusterIDFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return r.URL.Query().Get("clusterId")
 }

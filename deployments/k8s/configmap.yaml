@@ -8,7 +8,8 @@ data:
     listenAddr: ":9090"
     grpcAddr: ":9091"
     defaultAgentToken: "global-secret-token"
-    pollInterval: 30s
+    pollInterval: 0s
+    disableHttpPolling: true
     agents:
       - name: "production-cluster"
         type: "k8s"

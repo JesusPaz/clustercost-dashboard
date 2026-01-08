@@ -3,16 +3,17 @@ package api
 import (
 	"net/http"
 
-	"github.com/clustercost/clustercost-dashboard/internal/store"
+	"github.com/clustercost/clustercost-dashboard/internal/vm"
 )
 
 // Overview serves the aggregated overview payload.
 func (h *Handler) Overview(w http.ResponseWriter, r *http.Request) {
 	limit := parseLimit(r.URL.Query().Get("limitTopNamespaces"), 5, 20)
 
-	overview, err := h.store.Overview(limit)
+	ctx := vm.WithClusterID(r.Context(), clusterIDFromRequest(r))
+	overview, err := h.vm.Overview(ctx, limit)
 	if err != nil {
-		if err == store.ErrNoData {
+		if err == vm.ErrNoData {
 			writeError(w, http.StatusServiceUnavailable, "data not yet available")
 			return
 		}

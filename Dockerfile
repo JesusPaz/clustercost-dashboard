@@ -29,5 +29,6 @@ FROM --platform=$TARGETPLATFORM gcr.io/distroless/base-debian12:nonroot
 WORKDIR /app
 COPY --from=backend /dashboard /app/dashboard
 ENV LISTEN_ADDR=:9090
-EXPOSE 9090
+ENV GRPC_ADDR=:9091
+EXPOSE 9090 9091
 ENTRYPOINT ["/app/dashboard"]

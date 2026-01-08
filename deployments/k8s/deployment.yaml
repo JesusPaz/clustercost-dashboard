@@ -27,6 +27,8 @@ spec:
           env:
             - name: CONFIG_FILE
               value: "/etc/clustercost/config.yaml"
+            - name: DISABLE_HTTP_POLLING
+              value: "true"
           volumeMounts:
             - name: config-volume
               mountPath: /etc/clustercost

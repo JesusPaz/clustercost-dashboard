@@ -1,40 +1,64 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/clustercost/clustercost-dashboard/internal/agents"
-	"github.com/clustercost/clustercost-dashboard/internal/config"
 	"github.com/clustercost/clustercost-dashboard/internal/store"
+	"github.com/clustercost/clustercost-dashboard/internal/vm"
 )
 
-func newTestHandler() *Handler {
-	cfgs := []config.AgentConfig{
-		{Name: "agent", BaseURL: "http://example.com", Type: "k8s"},
-	}
-	s := store.New(cfgs, "v1.0.0")
-	return &Handler{store: s}
+type fakeMetricsProvider struct {
+	meta   store.ClusterMetadata
+	status store.AgentStatusPayload
+}
+
+func (f *fakeMetricsProvider) Overview(context.Context, int) (store.OverviewPayload, error) {
+	return store.OverviewPayload{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) NamespaceList(context.Context, store.NamespaceFilter) (store.NamespaceListResponse, error) {
+	return store.NamespaceListResponse{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) NamespaceDetail(context.Context, string) (store.NamespaceSummary, error) {
+	return store.NamespaceSummary{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) NodeList(context.Context, store.NodeFilter) (store.NodeListResponse, error) {
+	return store.NodeListResponse{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) NodeDetail(context.Context, string) (store.NodeSummary, error) {
+	return store.NodeSummary{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) Resources(context.Context) (store.ResourcesPayload, error) {
+	return store.ResourcesPayload{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) AgentStatus(context.Context) (store.AgentStatusPayload, error) {
+	return f.status, nil
+}
+func (f *fakeMetricsProvider) Agents(context.Context) ([]store.AgentInfo, error) {
+	return nil, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) ClusterMetadata(context.Context) (store.ClusterMetadata, error) {
+	return f.meta, nil
+}
+
+func newTestHandler(meta store.ClusterMetadata, status store.AgentStatusPayload) *Handler {
+	return &Handler{vm: &fakeMetricsProvider{meta: meta, status: status}}
 }
 
 func TestHealthHandlerReturnsClusterMetadata(t *testing.T) {
-	h := newTestHandler()
 	now := time.Now().UTC()
-	h.store.Update("agent", store.AgentSnapshot{
-		LastScrape: now,
-		Health: &agents.HealthResponse{
-			Status:      "healthy",
-			ClusterID:   "cluster-123",
-			ClusterName: "Test Cluster",
-			ClusterType: "k8s",
-			Region:      "us-east-2",
-			Version:     "dev",
-			Timestamp:   now,
-		},
-	})
+	h := newTestHandler(store.ClusterMetadata{
+		ID:        "cluster-123",
+		Name:      "Test Cluster",
+		Type:      "k8s",
+		Region:    "us-east-2",
+		Version:   "dev",
+		Timestamp: now,
+	}, store.AgentStatusPayload{Status: "connected"})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
 	rec := httptest.NewRecorder()

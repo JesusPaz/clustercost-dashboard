@@ -9,13 +9,24 @@ import (
 	"github.com/clustercost/clustercost-dashboard/internal/config"
 	ccgrpc "github.com/clustercost/clustercost-dashboard/internal/grpc"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
-	"github.com/clustercost/clustercost-dashboard/internal/store"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+type fakeIngestor struct {
+	received chan *agentv1.ReportRequest
+}
+
+func (f *fakeIngestor) Enqueue(agentName string, req *agentv1.ReportRequest) bool {
+	if req == nil {
+		return false
+	}
+	f.received <- req
+	return true
+}
 
 func TestGRPCServer_Integration(t *testing.T) {
 	// 1. Setup
@@ -32,9 +43,6 @@ func TestGRPCServer_Integration(t *testing.T) {
 		},
 	}
 
-	// Initialize Store
-	s := store.New(cfg.Agents, "v1.0.0")
-
 	// Start Server
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -42,7 +50,8 @@ func TestGRPCServer_Integration(t *testing.T) {
 	}
 	defer lis.Close()
 
-	srv := ccgrpc.NewServer(s, cfg)
+	ingestor := &fakeIngestor{received: make(chan *agentv1.ReportRequest, 10)}
+	srv := ccgrpc.NewServer(cfg, ingestor)
 
 	// Run server in goroutine
 	go func() {
@@ -116,47 +125,13 @@ func TestGRPCServer_Integration(t *testing.T) {
 		t.Errorf("Default token Report not accepted: %s", resp.ErrorMessage)
 	}
 
-	// 6. Verify Store Update
-	// Allow a moment for update (though it should be synchronous in our impl)
-	snapshots := s.Agents()
-	found := false
-	for _, info := range snapshots {
-		if info.Name == agentName {
-			if info.Status != "connected" {
-				t.Errorf("expected status connected, got %s", info.Status)
-			}
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("agent %s not found in store", agentName)
-	}
-
-	// Check default token agent
-	foundDefault := false
-	for _, info := range snapshots {
-		if info.Name == unknownAgent {
-			foundDefault = true
-			break
-		}
-	}
-	if !foundDefault {
-		t.Errorf("default token agent %s not found in store", unknownAgent)
-	}
-
-	// Deep check
-	nsSummary, err := s.NamespaceDetail("default")
-	if err != nil {
-		t.Errorf("failed to get namespace detail: %v", err)
-	} else {
-		if nsSummary.HourlyCost != 1.5 {
-			t.Errorf("expected cost 1.5, got %f", nsSummary.HourlyCost)
+	// 6. Verify Ingestor received reports
+	expectReports := 2
+	for i := 0; i < expectReports; i++ {
+		select {
+		case <-ingestor.received:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected report %d/%d to be ingested", i+1, expectReports)
 		}
 	}
 }
-
-// Helper to expose Serve for testing since the struct wraps grpc.Server
-// We need to modify internal/grpc/server.go to expose the raw server or a Serve method for the listener.
-// Currently it has ListenAndServe which creates listener.
-// Let's modify Server.go to allow passing a listener or exposing Serve.

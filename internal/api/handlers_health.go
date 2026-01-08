@@ -4,25 +4,25 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/clustercost/clustercost-dashboard/internal/store"
+	"github.com/clustercost/clustercost-dashboard/internal/vm"
 )
 
 // Health returns a simple readiness payload.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-	meta, err := h.store.ClusterMetadata()
+	ctx := vm.WithClusterID(r.Context(), clusterIDFromRequest(r))
+	meta, err := h.vm.ClusterMetadata(ctx)
 	timestamp := meta.Timestamp
 	status := "ok"
 
 	switch err {
 	case nil:
-		agents := h.store.Agents()
-		for _, agent := range agents {
-			if agent.Status != "healthy" {
-				status = "degraded"
-				break
-			}
+		agentStatus, statusErr := h.vm.AgentStatus(ctx)
+		if statusErr != nil {
+			status = "degraded"
+		} else if agentStatus.Status != "connected" {
+			status = "degraded"
 		}
-	case store.ErrNoData:
+	case vm.ErrNoData:
 		status = "initializing"
 		if timestamp.IsZero() {
 			timestamp = time.Now().UTC()

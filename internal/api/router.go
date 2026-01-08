@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -12,14 +13,27 @@ import (
 	"github.com/clustercost/clustercost-dashboard/internal/store"
 )
 
-// Handler wires HTTP requests to the in-memory store.
+// MetricsProvider defines the data backend used by API handlers.
+type MetricsProvider interface {
+	Overview(ctx context.Context, limit int) (store.OverviewPayload, error)
+	NamespaceList(ctx context.Context, filter store.NamespaceFilter) (store.NamespaceListResponse, error)
+	NamespaceDetail(ctx context.Context, name string) (store.NamespaceSummary, error)
+	NodeList(ctx context.Context, filter store.NodeFilter) (store.NodeListResponse, error)
+	NodeDetail(ctx context.Context, name string) (store.NodeSummary, error)
+	Resources(ctx context.Context) (store.ResourcesPayload, error)
+	AgentStatus(ctx context.Context) (store.AgentStatusPayload, error)
+	Agents(ctx context.Context) ([]store.AgentInfo, error)
+	ClusterMetadata(ctx context.Context) (store.ClusterMetadata, error)
+}
+
+// Handler wires HTTP requests to the VictoriaMetrics client.
 type Handler struct {
-	store *store.Store
+	vm MetricsProvider
 }
 
 // NewRouter builds the HTTP router serving both JSON APIs and static assets.
-func NewRouter(s *store.Store) http.Handler {
-	h := &Handler{store: s}
+func NewRouter(vmClient MetricsProvider) http.Handler {
+	h := &Handler{vm: vmClient}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

@@ -3,14 +3,15 @@ package api
 import (
 	"net/http"
 
-	"github.com/clustercost/clustercost-dashboard/internal/store"
+	"github.com/clustercost/clustercost-dashboard/internal/vm"
 )
 
 // AgentStatus returns the aggregated agent connection status.
 func (h *Handler) AgentStatus(w http.ResponseWriter, r *http.Request) {
-	status, err := h.store.AgentStatus()
+	ctx := vm.WithClusterID(r.Context(), clusterIDFromRequest(r))
+	status, err := h.vm.AgentStatus(ctx)
 	if err != nil {
-		if err == store.ErrNoData {
+		if err == vm.ErrNoData {
 			writeError(w, http.StatusServiceUnavailable, "agent data not yet available")
 			return
 		}
