@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"fmt"
+	"log"
 	"net"
 
 	"github.com/clustercost/clustercost-dashboard/internal/config"
@@ -24,7 +25,7 @@ func NewServer(cfg config.Config, ingestor ReportIngestor) *Server {
 	gsrv := grpc.NewServer(opts...)
 
 	collector := NewCollector(ingestor)
-	agentv1.RegisterCollectorServer(gsrv, collector)
+	agentv1.RegisterAgentServiceServer(gsrv, collector)
 
 	// Register reflection service on gRPC server (useful for grpcurl).
 	reflection.Register(gsrv)
@@ -39,6 +40,7 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
+	log.Printf("[gRPC] Server listening on %s", addr)
 	return s.Serve(lis)
 }
 

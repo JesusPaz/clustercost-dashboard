@@ -1,11 +1,14 @@
 import { Outlet } from "react-router-dom";
 import LayoutShell from "./components/layout/LayoutShell";
+import { AuthProvider } from "./context/AuthContext";
 
 const App = () => {
   return (
-    <LayoutShell>
-      <Outlet />
-    </LayoutShell>
+    <AuthProvider>
+      <LayoutShell>
+        <Outlet />
+      </LayoutShell>
+    </AuthProvider>
   );
 };
 

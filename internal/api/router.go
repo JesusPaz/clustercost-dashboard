@@ -9,6 +9,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/clustercost/clustercost-dashboard/internal/auth"
+	"github.com/clustercost/clustercost-dashboard/internal/db"
 	"github.com/clustercost/clustercost-dashboard/internal/static"
 	"github.com/clustercost/clustercost-dashboard/internal/store"
 )
@@ -29,11 +31,15 @@ type MetricsProvider interface {
 // Handler wires HTTP requests to the VictoriaMetrics client.
 type Handler struct {
 	vm MetricsProvider
+	db *db.Store
 }
 
 // NewRouter builds the HTTP router serving both JSON APIs and static assets.
-func NewRouter(vmClient MetricsProvider) http.Handler {
-	h := &Handler{vm: vmClient}
+func NewRouter(vmClient MetricsProvider, db *db.Store) http.Handler {
+	h := &Handler{
+		vm: vmClient,
+		db: db,
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -41,24 +47,31 @@ func NewRouter(vmClient MetricsProvider) http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{http.MethodGet, http.MethodOptions},
+		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodOptions}, // Added POST for Login
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With"},
 		AllowCredentials: false,
 		MaxAge:           300,
 	}))
 
 	r.Route("/api", func(api chi.Router) {
+		// Public routes
 		api.Get("/health", h.Health)
-		api.Route("/cost", func(cost chi.Router) {
-			cost.Get("/overview", h.Overview)
-			cost.Get("/namespaces", h.Namespaces)
-			cost.Get("/namespaces/{name}", h.NamespaceDetail)
-			cost.Get("/nodes", h.Nodes)
-			cost.Get("/nodes/{name}", h.NodeDetail)
-			cost.Get("/resources", h.Resources)
+		api.Post("/login", h.Login)
+
+		// Protected routes
+		api.Group(func(protected chi.Router) {
+			protected.Use(auth.Middleware)
+			protected.Route("/cost", func(cost chi.Router) {
+				cost.Get("/overview", h.Overview)
+				cost.Get("/namespaces", h.Namespaces)
+				cost.Get("/namespaces/{name}", h.NamespaceDetail)
+				cost.Get("/nodes", h.Nodes)
+				cost.Get("/nodes/{name}", h.NodeDetail)
+				cost.Get("/resources", h.Resources)
+			})
+			protected.Get("/agent", h.AgentStatus)
+			protected.Get("/agents", h.Agents)
 		})
-		api.Get("/agent", h.AgentStatus)
-		api.Get("/agents", h.Agents)
 	})
 
 	r.Handle("/*", static.Handler())

@@ -237,58 +237,123 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 	tsMillis := reportTimestampMillis(req)
 	agentName := env.agentName
 	if agentName == "" {
-		agentName = req.AgentId
+		agentName = env.req.AgentId
+	}
+	// Fallback
+	if agentName == "" {
+		agentName = "unknown"
 	}
 
 	meta := i.agentMeta[agentName]
-	base := baseLabels(agentName, req.ClusterId, req.ClusterName, meta)
+	base := baseLabels(agentName, env.req.ClusterId, env.req.ClusterName, meta)
 
-	version := strings.TrimSpace(req.Version)
-	labels := appendLabels(base, label{"version", version})
-	writeSample(buf, "clustercost_agent_up", labels, "1", tsMillis)
+	// Report agent up
+	writeSample(buf, "clustercost_agent_up", base, "1", tsMillis)
 
 	if req.Snapshot == nil {
 		return
 	}
 
-	for _, item := range req.Snapshot.Namespaces {
-		nsLabels := appendLabels(base,
-			label{"namespace", item.Namespace},
-			label{"environment", item.Environment},
+	// 2. Process Pods & Aggregate Namespace Data
+	type nsAgg struct {
+		hourlyCost         float64
+		podCount           int64
+		cpuRequestMilli    int64
+		cpuUsageMilli      int64
+		memoryRequestBytes int64
+		memoryUsageBytes   int64
+	}
+	// map[namespace]map[environment]*nsAgg
+	nsMap := make(map[string]map[string]*nsAgg)
+
+	for _, pod := range req.Snapshot.Pods {
+		if pod == nil {
+			continue
+		}
+
+		environment := pod.Labels["environment"]
+		if environment == "" {
+			environment = "unknown"
+		}
+		// v2 PodMetric has simple labels map.
+
+		nodeName := req.NodeName
+
+		podLabels := appendLabels(base,
+			label{"namespace", pod.Namespace},
+			label{"pod", pod.Pod},
+			label{"node", nodeName},
+			label{"environment", environment},
 		)
-		writeSample(buf, "clustercost_namespace_hourly_cost", nsLabels, formatFloat(item.HourlyCost), tsMillis)
-		writeSample(buf, "clustercost_namespace_pod_count", nsLabels, formatInt(int64(item.PodCount)), tsMillis)
-		writeSample(buf, "clustercost_namespace_cpu_request_milli", nsLabels, formatInt(item.CpuRequestMilli), tsMillis)
-		writeSample(buf, "clustercost_namespace_cpu_usage_milli", nsLabels, formatInt(item.CpuUsageMilli), tsMillis)
-		writeSample(buf, "clustercost_namespace_memory_request_bytes", nsLabels, formatInt(item.MemoryRequestBytes), tsMillis)
-		writeSample(buf, "clustercost_namespace_memory_usage_bytes", nsLabels, formatInt(item.MemoryUsageBytes), tsMillis)
+		// Owner references are not in v2 top-level, assumingly maybe in labels or missing.
+		// We skip them for now.
+
+		// Add custom labels
+		for k, v := range pod.Labels {
+			if k == "app" || k == "component" || k == "service" {
+				podLabels = append(podLabels, label{k, v})
+			}
+		}
+
+		// Calculate Totals and Costs
+		// CPU
+		cpuSeconds := float64(0)
+		if pod.CpuMetrics != nil {
+			// v2: usage_user_ns + usage_kernel_ns
+			ns := pod.CpuMetrics.UsageUserNs + pod.CpuMetrics.UsageKernelNs
+			cpuSeconds = float64(ns) / 1e9
+		}
+
+		// Memory
+		memBytes := int64(0)
+		if pod.MemoryMetrics != nil {
+			memBytes = int64(pod.MemoryMetrics.RssBytes)
+		}
+
+		// Network
+		netTx := int64(0)
+		netRx := int64(0)
+		egressPublic := int64(0)
+		if pod.NetworkMetrics != nil {
+			netTx = int64(pod.NetworkMetrics.BytesSent)
+			netRx = int64(pod.NetworkMetrics.BytesRecv)
+			egressPublic = int64(pod.NetworkMetrics.EgressPublicBytes)
+		}
+
+		writeSample(buf, "clustercost_pod_cpu_usage_seconds_total", podLabels, formatFloat(cpuSeconds), tsMillis)
+		writeSample(buf, "clustercost_pod_memory_rss_bytes", podLabels, formatInt(memBytes), tsMillis)
+		writeSample(buf, "clustercost_pod_network_tx_bytes_total", podLabels, formatInt(netTx), tsMillis)
+		writeSample(buf, "clustercost_pod_network_rx_bytes_total", podLabels, formatInt(netRx), tsMillis)
+		writeSample(buf, "clustercost_pod_network_egress_public_bytes_total", podLabels, formatInt(egressPublic), tsMillis)
+
+		// Aggregate for Namespace
+		// We can still aggregate usage for namespace if we want, but "Hourly Cost" is hard without rate.
+		// We'll skip aggregated cost for now and focus on raw metrics.
+		// Or we can just sum the raw counters for namespace.
+		if nsMap[pod.Namespace] == nil {
+			nsMap[pod.Namespace] = make(map[string]*nsAgg)
+		}
+		if nsMap[pod.Namespace][environment] == nil {
+			nsMap[pod.Namespace][environment] = &nsAgg{}
+		}
+		agg := nsMap[pod.Namespace][environment]
+		agg.podCount++
+		// agg.cpuUsageMilli += ??? We have seconds total.
 	}
 
-	for _, item := range req.Snapshot.Nodes {
-		nodeLabels := appendLabels(base,
-			label{"node", item.NodeName},
-		)
-		writeSample(buf, "clustercost_node_hourly_cost", appendLabels(nodeLabels, label{"instance_type", item.InstanceType}), formatFloat(item.HourlyCost), tsMillis)
-		writeSample(buf, "clustercost_node_cpu_usage_percent", nodeLabels, formatFloat(item.CpuUsagePercent), tsMillis)
-		writeSample(buf, "clustercost_node_memory_usage_percent", nodeLabels, formatFloat(item.MemoryUsagePercent), tsMillis)
-		writeSample(buf, "clustercost_node_cpu_allocatable_milli", nodeLabels, formatInt(item.CpuAllocatableMilli), tsMillis)
-		writeSample(buf, "clustercost_node_memory_allocatable_bytes", nodeLabels, formatInt(item.MemoryAllocatableBytes), tsMillis)
-		writeSample(buf, "clustercost_node_pod_count", nodeLabels, formatInt(int64(item.PodCount)), tsMillis)
-		writeSample(buf, "clustercost_node_under_pressure", nodeLabels, formatBool(item.IsUnderPressure), tsMillis)
-		if item.Status != "" {
-			statusLabels := appendLabels(nodeLabels, label{"status", item.Status})
-			writeSample(buf, "clustercost_node_status", statusLabels, "1", tsMillis)
+	// 3. Emit Aggregated Namespace Metrics
+	for ns, envs := range nsMap {
+		for env, agg := range envs {
+			nsLabels := appendLabels(base,
+				label{"namespace", ns},
+				label{"environment", env},
+			)
+			writeSample(buf, "clustercost_namespace_pod_count", nsLabels, formatInt(agg.podCount), tsMillis)
 		}
 	}
 
-	if req.Snapshot.Resources != nil {
-		resLabels := base
-		writeSample(buf, "clustercost_cluster_cpu_usage_milli_total", resLabels, formatInt(req.Snapshot.Resources.CpuUsageMilliTotal), tsMillis)
-		writeSample(buf, "clustercost_cluster_cpu_request_milli_total", resLabels, formatInt(req.Snapshot.Resources.CpuRequestMilliTotal), tsMillis)
-		writeSample(buf, "clustercost_cluster_memory_usage_bytes_total", resLabels, formatInt(req.Snapshot.Resources.MemoryUsageBytesTotal), tsMillis)
-		writeSample(buf, "clustercost_cluster_memory_request_bytes_total", resLabels, formatInt(req.Snapshot.Resources.MemoryRequestBytesTotal), tsMillis)
-		writeSample(buf, "clustercost_cluster_total_node_hourly_cost", resLabels, formatFloat(req.Snapshot.Resources.TotalNodeHourlyCost), tsMillis)
-	}
+	// 4. Resources Snapshot - Removed in V2.
+
 }
 
 func buildIngestURL(baseURL, ingestPath string) (string, error) {
@@ -398,17 +463,9 @@ func formatBool(value bool) string {
 }
 
 func reportTimestampMillis(req *agentv1.ReportRequest) int64 {
-	if req == nil {
-		return time.Now().UnixMilli()
-	}
-	ts := req.TimestampSeconds
-	if req.Snapshot != nil && req.Snapshot.TimestampSeconds > 0 {
-		ts = req.Snapshot.TimestampSeconds
-	}
-	if ts <= 0 {
-		return time.Now().UnixMilli()
-	}
-	return ts * 1000
+	// ReportRequest v2 does not have a timestamp field.
+	// We use ingestion time.
+	return time.Now().UnixMilli()
 }
 
 func max(a, b int) int {

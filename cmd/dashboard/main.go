@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/clustercost/clustercost-dashboard/internal/api"
+	"github.com/clustercost/clustercost-dashboard/internal/auth"
 	"github.com/clustercost/clustercost-dashboard/internal/config"
+	"github.com/clustercost/clustercost-dashboard/internal/db"
 	ccgrpc "github.com/clustercost/clustercost-dashboard/internal/grpc"
 	"github.com/clustercost/clustercost-dashboard/internal/logging"
 	"github.com/clustercost/clustercost-dashboard/internal/vm"
@@ -30,9 +32,17 @@ func main() {
 		logger.Fatalf("victoria metrics query setup error: %v", err)
 	}
 
+	sqlite, err := db.New(cfg.StoragePath)
+	if err != nil {
+		logger.Fatalf("sqlite setup error: %v", err)
+	}
+	defer sqlite.Close()
+
+	auth.SetSecret(cfg.JWTSecret)
+
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: api.NewRouter(vmClient),
+		Handler: api.NewRouter(vmClient, sqlite),
 	}
 
 	vmIngestor, err := vm.NewIngestor(cfg, logger)

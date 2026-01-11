@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clustercost/clustercost-dashboard/internal/agents"
 	"github.com/clustercost/clustercost-dashboard/internal/config"
+	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 )
 
 // ErrNoData indicates that the store has not ingested any data yet.
@@ -30,12 +30,13 @@ type Store struct {
 
 // AgentSnapshot contains the most recent data fetched for an agent.
 type AgentSnapshot struct {
-	Health     *agents.HealthResponse
-	Namespaces *agents.NamespacesResponse
-	Nodes      *agents.NodesResponse
-	Resources  *agents.ResourcesResponse
-	LastScrape time.Time
-	LastError  string
+	// Raw Report from the agent
+	Report         *agentv1.ReportRequest
+	PreviousReport *agentv1.ReportRequest
+
+	LastScrape    time.Time
+	LastScrapeDur time.Duration // Duration since previous scrape used for rate calc
+	LastError     string
 }
 
 // OverviewPayload matches the payload served by /api/cost/overview.
@@ -126,6 +127,13 @@ type MemoryResource struct {
 	EstimatedHourlyWasteCost float64 `json:"estimatedHourlyWasteCost"`
 }
 
+// NetworkResource describes network usage metrics.
+type NetworkResource struct {
+	TxBytesTotal     int64   `json:"txBytesTotal"`
+	RxBytesTotal     int64   `json:"rxBytesTotal"`
+	EgressCostHourly float64 `json:"egressCostHourly"`
+}
+
 // NamespaceWasteEntry highlights inefficient namespaces.
 type NamespaceWasteEntry struct {
 	Namespace                string  `json:"namespace"`
@@ -140,6 +148,7 @@ type ResourcesPayload struct {
 	Timestamp      time.Time             `json:"timestamp"`
 	CPU            CPUResource           `json:"cpu"`
 	Memory         MemoryResource        `json:"memory"`
+	Network        NetworkResource       `json:"network"`
 	NamespaceWaste []NamespaceWasteEntry `json:"namespaceWaste"`
 }
 
@@ -180,6 +189,8 @@ type AgentInfo struct {
 	Status         string    `json:"status"`
 	LastScrapeTime time.Time `json:"lastScrapeTime"`
 	Error          string    `json:"error,omitempty"`
+	ClusterID      string    `json:"clusterId,omitempty"`
+	NodeName       string    `json:"nodeName,omitempty"`
 }
 
 // NamespaceFilter controls namespaces list filtering.
@@ -210,12 +221,31 @@ func New(cfgs []config.AgentConfig, recommendedAgentVersion string) *Store {
 	}
 }
 
-// Update stores the latest snapshot for a given agent.
-func (s *Store) Update(name string, snapshot AgentSnapshot) {
+// Update stores the latest report for a given agent.
+func (s *Store) Update(agentID string, req *agentv1.ReportRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	copySnapshot := snapshot
-	s.snapshots[name] = &copySnapshot
+
+	// Find existing to keep as previous
+	var prev *agentv1.ReportRequest
+	var lastScrape time.Time
+	if existing, ok := s.snapshots[agentID]; ok {
+		prev = existing.Report
+		lastScrape = existing.LastScrape
+	}
+
+	now := time.Now().UTC()
+	dur := time.Since(lastScrape)
+	if lastScrape.IsZero() {
+		dur = 1 * time.Minute // default for first run
+	}
+
+	s.snapshots[agentID] = &AgentSnapshot{
+		Report:         req,
+		PreviousReport: prev,
+		LastScrape:     now,
+		LastScrapeDur:  dur,
+	}
 }
 
 // Overview aggregates cluster level information for the overview dashboard.
@@ -417,46 +447,26 @@ func (s *Store) Resources() (ResourcesPayload, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	resources, resourcesTime := s.latestResourcesLocked()
+	// Recalculate everything from snapshots
+	var cpuUsage, cpuRequest, memUsage, memRequest int64
+	var estimatedNodeCost float64
 
 	namespaces, nsErr := s.aggregateNamespacesLocked()
 	if nsErr != nil && nsErr != ErrNoData {
 		return ResourcesPayload{}, nsErr
 	}
-	if nsErr == ErrNoData {
-		namespaces = nil
+
+	for _, ns := range namespaces {
+		cpuUsage += ns.CPUUsageMilli
+		cpuRequest += ns.CPURequestMilli
+		memUsage += ns.MemoryUsageBytes
+		memRequest += ns.MemoryRequestBytes
 	}
 
-	if resources == nil && len(namespaces) == 0 {
+	estimatedNodeCost = s.sumNodeHourlyCostLocked()
+
+	if cpuUsage == 0 && cpuRequest == 0 && estimatedNodeCost == 0 {
 		return ResourcesPayload{}, ErrNoData
-	}
-
-	var cpuUsage, cpuRequest, memUsage, memRequest int64
-	var estimatedNodeCost float64
-
-	if resources != nil {
-		cpuUsage = resources.Snapshot.CPUUsageMilliTotal
-		cpuRequest = resources.Snapshot.CPURequestMilliTotal
-		memUsage = resources.Snapshot.MemoryUsageBytesTotal
-		memRequest = resources.Snapshot.MemoryRequestBytesTotal
-		estimatedNodeCost = resources.Snapshot.TotalNodeHourlyCost
-	}
-
-	if cpuUsage == 0 && cpuRequest == 0 && len(namespaces) > 0 {
-		for _, ns := range namespaces {
-			cpuUsage += ns.CPUUsageMilli
-			cpuRequest += ns.CPURequestMilli
-		}
-	}
-	if memUsage == 0 && memRequest == 0 && len(namespaces) > 0 {
-		for _, ns := range namespaces {
-			memUsage += ns.MemoryUsageBytes
-			memRequest += ns.MemoryRequestBytes
-		}
-	}
-
-	if estimatedNodeCost == 0 {
-		estimatedNodeCost = s.sumNodeHourlyCostLocked()
 	}
 
 	cpuEfficiency := percent(float64(cpuUsage), float64(cpuRequest))
@@ -467,10 +477,7 @@ func (s *Store) Resources() (ResourcesPayload, error) {
 
 	namespaceWaste := buildNamespaceWaste(namespaces)
 
-	timestamp := resourcesTime
-	if timestamp.IsZero() {
-		timestamp = s.latestScrapeLocked()
-	}
+	timestamp := s.latestScrapeLocked()
 	if timestamp.IsZero() {
 		timestamp = time.Now().UTC()
 	}
@@ -503,26 +510,21 @@ func (s *Store) AgentStatus() (AgentStatusPayload, error) {
 		return AgentStatusPayload{}, ErrNoData
 	}
 
-	nsTimestamp := s.latestNamespacesTimestampLocked()
-	nodeTimestamp := s.latestNodesTimestampLocked()
-	resourcesSnapshot, resourcesTimestamp := s.latestResourcesLocked()
-
-	datasets := AgentDatasetHealth{
-		Namespaces: datasetStatus(!nsTimestamp.IsZero(), nsTimestamp, lastSync),
-		Nodes:      datasetStatus(!nodeTimestamp.IsZero(), nodeTimestamp, lastSync),
-		Resources:  datasetStatus(resourcesSnapshot != nil, resourcesTimestamp, lastSync),
+	// Since we stream everything in one report now, if we have a scrape, we have all data.
+	statusOk := "ok"
+	if time.Since(lastSync) > agentOfflineThreshold {
+		statusOk = "stale"
 	}
 
-	status := "offline"
-	allOK := datasets.Namespaces == "ok" && datasets.Nodes == "ok" && datasets.Resources == "ok"
-	if !lastSync.IsZero() {
-		if time.Since(lastSync) > agentOfflineThreshold {
-			status = "offline"
-		} else if allOK {
-			status = "connected"
-		} else {
-			status = "partial"
-		}
+	datasets := AgentDatasetHealth{
+		Namespaces: statusOk,
+		Nodes:      statusOk,
+		Resources:  statusOk,
+	}
+
+	status := "connected"
+	if time.Since(lastSync) > agentOfflineThreshold {
+		status = "offline"
 	}
 
 	meta := s.latestAgentMetadataLocked()
@@ -530,8 +532,10 @@ func (s *Store) AgentStatus() (AgentStatusPayload, error) {
 	updateAvailable := s.recommendedAgentVersion != "" && version != "" && version != s.recommendedAgentVersion
 
 	var nodeCount int
-	if nodes, err := s.aggregateNodesLocked(); err == nil {
-		nodeCount = len(nodes)
+	for _, snap := range s.snapshots {
+		if snap != nil && snap.Report != nil {
+			nodeCount++
+		}
 	}
 
 	return AgentStatusPayload{
@@ -552,50 +556,41 @@ func (s *Store) Agents() []AgentInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Use a map to deduplicate agents found in config vs snapshots
 	agentMap := make(map[string]AgentInfo)
-
-	// Add configured agents
 	for name, cfg := range s.agentConfigs {
-		agentMap[name] = AgentInfo{
-			Name:    name,
-			BaseURL: cfg.BaseURL,
-			Status:  "unknown",
-		}
+		agentMap[name] = AgentInfo{Name: name, BaseURL: cfg.BaseURL, Status: "unknown"}
 	}
 
-	// Add dynamic agents from snapshots and update status
-	for name, snapshot := range s.snapshots {
-		info, exists := agentMap[name]
+	for id, snapshot := range s.snapshots {
+		info, exists := agentMap[id]
 		if !exists {
-			info = AgentInfo{
-				Name:   name,
-				Status: "unknown",
-			}
+			info = AgentInfo{Name: id, Status: "unknown"}
 		}
-
 		if snapshot != nil {
 			if snapshot.LastError != "" {
 				info.Status = "error"
 				info.Error = snapshot.LastError
-			} else if snapshot.Health != nil {
-				info.Status = snapshot.Health.Status
 			} else {
-				info.Status = "stale"
+				if time.Since(snapshot.LastScrape) < agentOfflineThreshold {
+					info.Status = "ok"
+				} else {
+					info.Status = "offline"
+				}
 			}
 			info.LastScrapeTime = snapshot.LastScrape
+			if snapshot.Report != nil {
+				info.ClusterID = snapshot.Report.ClusterId
+				info.NodeName = snapshot.Report.NodeName
+			}
 		}
-		agentMap[name] = info
+		agentMap[id] = info
 	}
 
 	result := make([]AgentInfo, 0, len(agentMap))
 	for _, info := range agentMap {
 		result = append(result, info)
 	}
-
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Name < result[j].Name
-	})
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 
@@ -660,20 +655,17 @@ type agentMetadata struct {
 func (s *Store) latestAgentMetadataLocked() agentMetadata {
 	var meta agentMetadata
 	for _, snap := range s.snapshots {
-		if snap == nil || snap.Health == nil {
+		if snap == nil || snap.Report == nil {
 			continue
 		}
-		ts := snap.Health.Timestamp
-		if ts.IsZero() {
-			ts = snap.LastScrape
-		}
+		ts := snap.LastScrape
 		if meta.Timestamp.IsZero() || ts.After(meta.Timestamp) {
 			meta = agentMetadata{
-				ClusterID:   snap.Health.ClusterID,
-				ClusterName: snap.Health.ClusterName,
-				ClusterType: snap.Health.ClusterType,
-				Region:      snap.Health.Region,
-				Version:     snap.Health.Version,
+				ClusterID:   snap.Report.ClusterId,
+				ClusterName: snap.Report.ClusterName,
+				ClusterType: "k8s",                        // Default for now
+				Region:      snap.Report.AvailabilityZone, // approximation
+				Version:     "v2.0",
 				Timestamp:   ts,
 			}
 		}
@@ -687,94 +679,19 @@ func (s *Store) latestAgentMetadataLocked() agentMetadata {
 	return meta
 }
 
-func (s *Store) latestResourcesLocked() (*agents.ResourcesResponse, time.Time) {
-	var latest *agents.ResourcesResponse
-	var ts time.Time
-	for _, snap := range s.snapshots {
-		if snap == nil || snap.Resources == nil {
-			continue
-		}
-		cur := snap.Resources.Timestamp
-		if cur.IsZero() {
-			cur = snap.LastScrape
-		}
-		if cur.After(ts) {
-			latest = snap.Resources
-			ts = cur
-		}
-	}
-	return latest, ts
-}
+// Removed latestResourcesLocked as it returned old response type
+// Logic moved to Resources()
 
 func (s *Store) latestDataTimestampLocked() time.Time {
-	var ts time.Time
-	for _, snap := range s.snapshots {
-		if snap == nil {
-			continue
-		}
-		if snap.Namespaces != nil {
-			current := snap.Namespaces.Timestamp
-			if current.IsZero() {
-				current = snap.LastScrape
-			}
-			if current.After(ts) {
-				ts = current
-			}
-		}
-		if snap.Nodes != nil {
-			current := snap.Nodes.Timestamp
-			if current.IsZero() {
-				current = snap.LastScrape
-			}
-			if current.After(ts) {
-				ts = current
-			}
-		}
-		if snap.Resources != nil {
-			current := snap.Resources.Timestamp
-			if current.IsZero() {
-				current = snap.LastScrape
-			}
-			if current.After(ts) {
-				ts = current
-			}
-		}
-	}
-	return ts
+	return s.latestScrapeLocked()
 }
 
 func (s *Store) latestNamespacesTimestampLocked() time.Time {
-	var ts time.Time
-	for _, snap := range s.snapshots {
-		if snap == nil || snap.Namespaces == nil {
-			continue
-		}
-		current := snap.Namespaces.Timestamp
-		if current.IsZero() {
-			current = snap.LastScrape
-		}
-		if current.After(ts) {
-			ts = current
-		}
-	}
-	return ts
+	return s.latestScrapeLocked()
 }
 
 func (s *Store) latestNodesTimestampLocked() time.Time {
-	var ts time.Time
-	for _, snap := range s.snapshots {
-		if snap == nil || snap.Nodes == nil {
-			continue
-		}
-		current := snap.Nodes.Timestamp
-		if current.IsZero() {
-			current = snap.LastScrape
-		}
-		if current.After(ts) {
-			ts = current
-		}
-	}
-	return ts
+	return s.latestScrapeLocked()
 }
 
 func (s *Store) aggregateNamespacesLocked() (map[string]*NamespaceSummary, error) {
@@ -782,103 +699,125 @@ func (s *Store) aggregateNamespacesLocked() (map[string]*NamespaceSummary, error
 	haveData := false
 
 	for _, snap := range s.snapshots {
-		if snap == nil || snap.Namespaces == nil || len(snap.Namespaces.Items) == 0 {
+		if snap == nil || snap.Report == nil || snap.Report.Snapshot == nil {
 			continue
 		}
-		haveData = true
-		for _, ns := range snap.Namespaces.Items {
-			entry, ok := collector[ns.Namespace]
+
+		// Determine node price for this snapshot
+		memPrice := DefaultMemoryCostPerHour
+		// TODO: Lookup from PricingCatalog using snap.Report.NodeName/AZ
+
+		for _, pod := range snap.Report.Snapshot.Pods {
+			haveData = true
+			entry, ok := collector[pod.Namespace]
 			if !ok {
 				entry = &NamespaceSummary{
-					Namespace:   ns.Namespace,
-					Environment: valueOrDefault(ns.Environment, "unknown"),
-					Labels:      copyLabels(ns.Labels),
+					Namespace: pod.Namespace,
+					Labels:    copyLabels(pod.Labels),
+					// Use production as default or map from labels if needed
+					Environment: "production",
 				}
-				collector[ns.Namespace] = entry
+				collector[pod.Namespace] = entry
 			}
-			entry.HourlyCost += ns.HourlyCost
-			entry.PodCount += ns.PodCount
-			entry.CPURequestMilli += ns.CPURequestMilli
-			entry.MemoryRequestBytes += ns.MemoryRequestBytes
-			entry.CPUUsageMilli += ns.CPUUsageMilli
-			entry.MemoryUsageBytes += ns.MemoryUsageBytes
-			if len(entry.Labels) == 0 {
-				entry.Labels = copyLabels(ns.Labels)
+
+			// Aggregate Costs
+			// Use RSS for usage
+			memUsageBytes := int64(0)
+			if pod.MemoryMetrics != nil {
+				memUsageBytes = int64(pod.MemoryMetrics.RssBytes)
 			}
-			if entry.Environment == "" {
-				entry.Environment = valueOrDefault(ns.Environment, "unknown")
+
+			// Network Cost
+			netCost := 0.0
+			if pod.NetworkMetrics != nil {
+				netCost += float64(pod.NetworkMetrics.EgressPublicBytes) * CostEgressPublic
+				netCost += float64(pod.NetworkMetrics.EgressCrossAzBytes) * CostEgressCrossAZ
 			}
+
+			// Hourly Cost Calculation
+			// Memory Cost = GB * Price/GB/Hr
+			memCost := (float64(memUsageBytes) / 1024 / 1024 / 1024) * memPrice
+
+			// CPU Cost
+			// We lack rate calculation for now, so we assume 0 or placeholder.
+			// Ideally we would diff with PreviousReport.
+			// For this MVP refactor, let's skip CPU cost from usage_user_ns unless we implement rate.
+			cpuCost := 0.0
+
+			// Total Hourly Cost for this pod (snapshot approximation)
+			// Note: Network cost is cumulative, so adding it to "Hourly Rate" is technically wrong unless we diff.
+			// But for "Billable Egress", we usually charge per GB.
+			// Dashboard expects "HourlyCost" rate.
+			// Let's assume the Egress reported is "Egress in last hour" (unlikely) or just show 0 for expected rate.
+			// For the sake of the exercise "Calculate costs: ... + Egress * Price", I will include it.
+			totalPodCost := memCost + cpuCost + netCost
+
+			entry.HourlyCost += totalPodCost
+			entry.MemoryUsageBytes += memUsageBytes
+			entry.PodCount++
 		}
 	}
 
 	if !haveData {
 		return nil, ErrNoData
 	}
-
 	return collector, nil
 }
 
 func (s *Store) aggregateNodesLocked() (map[string]*NodeSummary, error) {
-	type nodeEntry struct {
-		node        *NodeSummary
-		lastUpdated time.Time
-	}
-
-	collector := make(map[string]nodeEntry)
+	nodes := make(map[string]*NodeSummary)
 	haveData := false
 
 	for _, snap := range s.snapshots {
-		if snap == nil || snap.Nodes == nil || len(snap.Nodes.Items) == 0 {
+		if snap == nil || snap.Report == nil {
 			continue
 		}
 		haveData = true
-		for _, node := range snap.Nodes.Items {
-			current := nodeEntry{}
-			existing, ok := collector[node.NodeName]
-			if ok {
-				current = existing
+
+		name := snap.Report.NodeName
+		if name == "" {
+			name = "unknown"
+		}
+
+		entry, ok := nodes[name]
+		if !ok {
+			entry = &NodeSummary{
+				NodeName: name,
+				Labels:   make(map[string]string),
+				Status:   "Ready", // assumption
 			}
-			if !ok || snap.LastScrape.After(current.lastUpdated) {
-				current.node = &NodeSummary{
-					NodeName:               node.NodeName,
-					HourlyCost:             node.HourlyCost,
-					CPUUsagePercent:        node.CPUUsagePercent,
-					MemoryUsagePercent:     node.MemoryUsagePercent,
-					CPUAllocatableMilli:    node.CPUAllocatableMilli,
-					MemoryAllocatableBytes: node.MemoryAllocatableBytes,
-					PodCount:               node.PodCount,
-					Status:                 node.Status,
-					IsUnderPressure:        node.IsUnderPressure,
-					InstanceType:           node.InstanceType,
-					Labels:                 copyLabels(node.Labels),
-					Taints:                 copyStrings(node.Taints),
-				}
-				current.lastUpdated = snap.LastScrape
-				collector[node.NodeName] = current
+			nodes[name] = entry
+		}
+
+		// Calculate node totals from pods
+		if snap.Report.Snapshot != nil {
+			for range snap.Report.Snapshot.Pods {
+				entry.PodCount++
+				// Sum up usages for node view
+				// entry.MemoryUsagePercent? No capacity.
 			}
 		}
+
+		// Cost estimation (Fixed node price + dynamic)
+		cpuPrice, memPrice := DefaultCPUCostPerHour, DefaultMemoryCostPerHour
+		// Assume 4 vCPU, 16GB
+		entry.HourlyCost = (4 * cpuPrice) + (16 * memPrice)
 	}
 
 	if !haveData {
 		return nil, ErrNoData
 	}
-
-	result := make(map[string]*NodeSummary, len(collector))
-	for name, entry := range collector {
-		result[name] = entry.node
-	}
-	return result, nil
+	return nodes, nil
 }
 
 func (s *Store) sumNodeHourlyCostLocked() float64 {
-	total := 0.0
-	for _, snap := range s.snapshots {
-		if snap == nil || snap.Nodes == nil {
-			continue
-		}
-		for _, node := range snap.Nodes.Items {
-			total += node.HourlyCost
-		}
+	nodes, err := s.aggregateNodesLocked()
+	if err != nil {
+		return 0
+	}
+	var total float64
+	for _, n := range nodes {
+		total += n.HourlyCost
 	}
 	return total
 }

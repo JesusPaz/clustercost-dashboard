@@ -41,6 +41,8 @@ type Config struct {
 	VictoriaMetricsQueueSize     int           `yaml:"victoriaMetricsQueueSize"`
 	VictoriaMetricsGzip          bool          `yaml:"victoriaMetricsGzip"`
 	VictoriaMetricsLookback      time.Duration `yaml:"victoriaMetricsLookback"`
+	StoragePath                  string        `yaml:"storagePath"`
+	JWTSecret                    string        `yaml:"jwtSecret"`
 }
 
 // Default returns the default configuration used when no other information is provided.
@@ -58,6 +60,8 @@ func Default() Config {
 		VictoriaMetricsQueueSize:     10000,
 		VictoriaMetricsGzip:          true,
 		VictoriaMetricsLookback:      24 * time.Hour,
+		StoragePath:                  "data/clustercost.db",
+		JWTSecret:                    "clustercost-secret",
 	}
 }
 
@@ -200,6 +204,14 @@ func Load() (Config, error) {
 		cfg.VictoriaMetricsLookback = d
 	}
 
+	if storage := os.Getenv("STORAGE_PATH"); storage != "" {
+		cfg.StoragePath = storage
+	}
+
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		cfg.JWTSecret = secret
+	}
+
 	return cfg, nil
 }
 
@@ -281,7 +293,14 @@ func merge(dst *Config, src Config) {
 	if src.VictoriaMetricsGzip {
 		dst.VictoriaMetricsGzip = true
 	}
+	// ... (in merge function)
 	if src.VictoriaMetricsLookback != 0 {
 		dst.VictoriaMetricsLookback = src.VictoriaMetricsLookback
+	}
+	if src.StoragePath != "" {
+		dst.StoragePath = src.StoragePath
+	}
+	if src.JWTSecret != "" {
+		dst.JWTSecret = src.JWTSecret
 	}
 }

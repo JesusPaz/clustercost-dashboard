@@ -1,14 +1,15 @@
 package grpc
 
 import (
-	"context"
 	"fmt"
+	"io"
+	"log"
 
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 )
 
 type Collector struct {
-	agentv1.UnimplementedCollectorServer
+	agentv1.UnimplementedAgentServiceServer
 	ingestor ReportIngestor
 }
 
@@ -20,58 +21,49 @@ func NewCollector(ingestor ReportIngestor) *Collector {
 	return &Collector{ingestor: ingestor}
 }
 
-func (c *Collector) Report(ctx context.Context, req *agentv1.ReportRequest) (*agentv1.ReportResponse, error) {
-	if err := c.processReport(ctx, req); err != nil {
-		return &agentv1.ReportResponse{
-			Accepted:     false,
-			ErrorMessage: err.Error(),
-		}, nil
-	}
-	return &agentv1.ReportResponse{Accepted: true}, nil
-}
+func (c *Collector) Report(stream agentv1.AgentService_ReportServer) error {
+	// ctx := stream.Context()
 
-func (c *Collector) ReportBatch(ctx context.Context, req *agentv1.ReportBatchRequest) (*agentv1.ReportResponse, error) {
-	var lastErr error
-	for _, report := range req.Reports {
-		if err := c.processReport(ctx, report); err != nil {
-			lastErr = err
-			// Continue processing other reports?
-			// For now, we'll try to process all and return error if any failed.
-			// Ideally we should return partial success status, but the proto has simple boolean.
+	// Optional: Check auth from context once here if needed?
+	// But we might want to check agent_id in each message matches auth?
+
+	count := 0
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			// Done reading
+			return stream.SendAndClose(&agentv1.ReportResponse{Accepted: true})
 		}
-	}
+		if err != nil {
+			return err
+		}
 
-	if lastErr != nil {
-		return &agentv1.ReportResponse{
-			Accepted:     false,
-			ErrorMessage: fmt.Sprintf("some reports failed, last error: %v", lastErr),
-		}, nil
-	}
+		if err := c.processReport(req); err != nil {
+			log.Printf("Failed to process report from agent %s: %v", req.AgentId, err)
+			// Decide: return error and close stream, or just log and continue?
+			// Usually strict error handling for ingestion.
+			return err
+		}
+		count++
 
-	return &agentv1.ReportResponse{Accepted: true}, nil
+		// If we processed 100 messages, maybe we valid?
+		// We just stream until EOF.
+	}
 }
 
-func (c *Collector) processReport(ctx context.Context, req *agentv1.ReportRequest) error {
+func (c *Collector) processReport(req *agentv1.ReportRequest) error {
 	// Identify agent.
-	// Ideally we get agent name from context (AuthInterceptor), or we trust the agent_id in request.
-	// We'll use the agent_id from the request as the key for the store updates.
-	// If the auth interceptor put the "agent_name" in context, we could verify it matches or use it.
-
 	agentName := req.AgentId
 	if agentName == "" {
-		// Fallback to retrieving from context if available, or error
-		if name, ok := ctx.Value("agent_name").(string); ok {
-			agentName = name
-		} else {
-			return fmt.Errorf("missing agent_id")
-		}
+		return fmt.Errorf("missing agent_id")
 	}
 
 	if c.ingestor == nil {
-		return fmt.Errorf("victoria metrics ingestor not configured")
+		return fmt.Errorf("ingestor not configured")
 	}
+
 	if ok := c.ingestor.Enqueue(agentName, req); !ok {
-		return fmt.Errorf("victoria metrics ingest queue full")
+		return fmt.Errorf("ingest queue full")
 	}
 	return nil
 }

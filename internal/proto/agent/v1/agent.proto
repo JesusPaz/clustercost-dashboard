@@ -2,77 +2,63 @@ syntax = "proto3";
 
 package agent.v1;
 
-option go_package = "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1;agentv1";
+option go_package = "github.com/clustercost/backend/proto/agent/v1";
 
-service Collector {
-  rpc Report(ReportRequest) returns (ReportResponse);
-  rpc ReportBatch(ReportBatchRequest) returns (ReportResponse);
+service AgentService {
+  rpc Report(stream ReportRequest) returns (ReportResponse);
 }
 
 message ReportRequest {
   string cluster_id = 1;
   string cluster_name = 2;
   string node_name = 3;
-  string agent_id = 4;
-  string version = 5;
-  int64 timestamp_seconds = 6;
-  Snapshot snapshot = 7;
-}
-
-message ReportBatchRequest {
-  repeated ReportRequest reports = 1;
+  string availability_zone = 4;
+  string agent_id = 5;
+  Snapshot snapshot = 6;
 }
 
 message ReportResponse {
   bool accepted = 1;
-  string error_message = 2;
 }
 
 message Snapshot {
-  int64 timestamp_seconds = 1;
-  repeated NamespaceCostRecord namespaces = 2;
-  repeated NodeCostRecord nodes = 3;
-  ResourceSnapshot resources = 4;
-  NetworkSnapshot network = 5;
+  repeated PodMetric pods = 1;
+  // Nodes, Namespaces, Deployments metadata if you need them for enrichment
 }
 
-// Internal definitions for the records (assuming assumed fields based on existing models)
-
-message NamespaceCostRecord {
+message PodMetric {
   string namespace = 1;
-  string environment = 2;
-  double hourly_cost = 3;
-  int64 cpu_request_milli = 4;
-  int64 memory_request_bytes = 5;
-  int64 cpu_usage_milli = 6;
-  int64 memory_usage_bytes = 7;
-  map<string, string> labels = 8;
-  int32 pod_count = 9;
+  string pod = 2;
+  map<string, string> labels = 3;
+  
+  CpuMetrics cpu_metrics = 4;
+  MemoryMetrics memory_metrics = 5;
+  NetworkMetrics network_metrics = 6;
+  StorageMetrics storage_metrics = 7;
 }
 
-message NodeCostRecord {
-  string node_name = 1;
-  double hourly_cost = 2;
-  double cpu_usage_percent = 3;
-  double memory_usage_percent = 4;
-  int64 cpu_allocatable_milli = 5;
-  int64 memory_allocatable_bytes = 6;
-  int32 pod_count = 7;
-  string status = 8;
-  bool is_under_pressure = 9;
-  string instance_type = 10;
-  map<string, string> labels = 11;
-  repeated string taints = 12;
+message CpuMetrics {
+  uint64 usage_user_ns = 1;
+  uint64 usage_kernel_ns = 2;
+  uint64 throttling_ns = 3;
 }
 
-message ResourceSnapshot {
-  int64 cpu_usage_milli_total = 1;
-  int64 cpu_request_milli_total = 2;
-  int64 memory_usage_bytes_total = 3;
-  int64 memory_request_bytes_total = 4;
-  double total_node_hourly_cost = 5;
+message MemoryMetrics {
+  uint64 rss_bytes = 1;
+  uint64 page_faults = 2;
 }
 
-message NetworkSnapshot {
-  // Leaving empty for now as it's not fully defined in prompt, but slot exists.
+message NetworkMetrics {
+  uint64 bytes_sent = 1;
+  uint64 bytes_recv = 2;
+  uint64 egress_public_bytes = 3;   // $$$ High Cost
+  uint64 egress_cross_az_bytes = 4; // $$ Medium Cost
+  uint64 egress_internal_bytes = 5; // $ Low/Free
+}
+
+message StorageMetrics {
+  uint64 read_bytes = 1;
+  uint64 write_bytes = 2;
+  uint64 read_ops = 3;
+  uint64 write_ops = 4;
 }

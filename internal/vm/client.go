@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -69,7 +70,7 @@ func NewClient(cfg config.Config) (*Client, error) {
 		lookback = 24 * time.Hour
 	}
 
-	return &Client{
+	c := &Client{
 		baseURL:                 base,
 		lookback:                lookback,
 		recommendedAgentVersion: cfg.RecommendedAgentVersion,
@@ -80,7 +81,25 @@ func NewClient(cfg config.Config) (*Client, error) {
 		password:                cfg.VictoriaMetricsPassword,
 		cacheTTL:                defaultQueryCacheTTL,
 		cache:                   make(map[string]cachedQuery),
-	}, nil
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := c.Ping(ctx); err != nil {
+			log.Printf("[VictoriaMetrics] WARN: Failed initial connection check to %s: %v", base, err)
+		} else {
+			log.Printf("[VictoriaMetrics] Successfully connected to %s", base)
+		}
+	}()
+
+	return c, nil
+}
+
+// Ping checks connectivity to VictoriaMetrics.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.query(ctx, "1")
+	return err
 }
 
 func buildQueryURL(base string) (string, error) {

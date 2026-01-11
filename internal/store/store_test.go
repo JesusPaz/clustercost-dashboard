@@ -2,10 +2,9 @@ package store
 
 import (
 	"testing"
-	"time"
 
-	"github.com/clustercost/clustercost-dashboard/internal/agents"
 	"github.com/clustercost/clustercost-dashboard/internal/config"
+	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 )
 
 func newTestStore() *Store {
@@ -17,17 +16,13 @@ func newTestStore() *Store {
 
 func TestClusterMetadataReturnsLatestSnapshot(t *testing.T) {
 	s := newTestStore()
-	now := time.Now().UTC()
-	s.Update("test-agent", AgentSnapshot{
-		LastScrape: now,
-		Health: &agents.HealthResponse{
-			Status:      "ok",
-			ClusterID:   "cluster-1",
-			ClusterName: "Cluster One",
-			ClusterType: "k8s",
-			Region:      "us-east-1",
-			Version:     "dev",
-			Timestamp:   now,
+	s.Update("test-agent", &agentv1.ReportRequest{
+		AgentId:          "test-agent",
+		ClusterId:        "cluster-1",
+		ClusterName:      "Cluster One",
+		AvailabilityZone: "us-east-1", // Using AZ as Region proxy
+		Snapshot: &agentv1.Snapshot{
+			Pods: []*agentv1.PodMetric{},
 		},
 	})
 
@@ -44,8 +39,8 @@ func TestClusterMetadataReturnsLatestSnapshot(t *testing.T) {
 	if meta.Region != "us-east-1" {
 		t.Fatalf("expected region us-east-1, got %q", meta.Region)
 	}
-	if meta.Version != "dev" {
-		t.Fatalf("expected version dev, got %q", meta.Version)
+	if meta.Version != "v2.0" {
+		t.Fatalf("expected version v2.0, got %q", meta.Version)
 	}
 	if meta.Timestamp.IsZero() {
 		t.Fatal("expected metadata timestamp to be set")
@@ -54,30 +49,21 @@ func TestClusterMetadataReturnsLatestSnapshot(t *testing.T) {
 
 func TestAgentStatusConnectedWhenDataFresh(t *testing.T) {
 	s := newTestStore()
-	now := time.Now().UTC()
 
-	s.Update("test-agent", AgentSnapshot{
-		LastScrape: now,
-		Health: &agents.HealthResponse{
-			Status:      "ok",
-			ClusterID:   "cluster-2",
-			ClusterName: "Cluster Two",
-			ClusterType: "k8s",
-			Region:      "us-west-2",
-			Version:     "dev",
-			Timestamp:   now,
-		},
-		Namespaces: &agents.NamespacesResponse{
-			Timestamp: now,
-		},
-		Nodes: &agents.NodesResponse{
-			Timestamp: now,
-			Items: []agents.NodeCost{
-				{NodeName: "node-1"},
+	s.Update("test-agent", &agentv1.ReportRequest{
+		AgentId:          "test-agent",
+		ClusterId:        "cluster-2",
+		ClusterName:      "Cluster Two",
+		NodeName:         "node-1",
+		AvailabilityZone: "us-west-2",
+		Snapshot: &agentv1.Snapshot{
+			Pods: []*agentv1.PodMetric{
+				{
+					Namespace:     "default",
+					Pod:           "pod-1",
+					MemoryMetrics: &agentv1.MemoryMetrics{RssBytes: 1024 * 1024 * 100},
+				},
 			},
-		},
-		Resources: &agents.ResourcesResponse{
-			Timestamp: now,
 		},
 	})
 

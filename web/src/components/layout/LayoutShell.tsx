@@ -1,7 +1,14 @@
 import AppSidebar from "./AppSidebar";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { useAuth } from "@/context/AuthContext";
 
 const LayoutShell = ({ children }: { children: React.ReactNode }) => {
+  const { isAuthenticated } = useAuth();
+
+  if (!isAuthenticated) {
+    return <main className="min-h-screen bg-background text-foreground">{children}</main>;
+  }
+
   return (
     <SidebarProvider>
       <div className="flex min-h-screen bg-background text-foreground">

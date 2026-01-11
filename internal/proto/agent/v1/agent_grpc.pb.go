@@ -4,7 +4,7 @@
 // - protoc             v4.25.3
 // source: internal/proto/agent/v1/agent.proto
 
-package agentv1
+package v1
 
 import (
 	context "context"
@@ -19,141 +19,96 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Collector_Report_FullMethodName      = "/agent.v1.Collector/Report"
-	Collector_ReportBatch_FullMethodName = "/agent.v1.Collector/ReportBatch"
+	AgentService_Report_FullMethodName = "/agent.v1.AgentService/Report"
 )
 
-// CollectorClient is the client API for Collector service.
+// AgentServiceClient is the client API for AgentService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
-type CollectorClient interface {
-	Report(ctx context.Context, in *ReportRequest, opts ...grpc.CallOption) (*ReportResponse, error)
-	ReportBatch(ctx context.Context, in *ReportBatchRequest, opts ...grpc.CallOption) (*ReportResponse, error)
+type AgentServiceClient interface {
+	Report(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReportRequest, ReportResponse], error)
 }
 
-type collectorClient struct {
+type agentServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewCollectorClient(cc grpc.ClientConnInterface) CollectorClient {
-	return &collectorClient{cc}
+func NewAgentServiceClient(cc grpc.ClientConnInterface) AgentServiceClient {
+	return &agentServiceClient{cc}
 }
 
-func (c *collectorClient) Report(ctx context.Context, in *ReportRequest, opts ...grpc.CallOption) (*ReportResponse, error) {
+func (c *agentServiceClient) Report(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReportRequest, ReportResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReportResponse)
-	err := c.cc.Invoke(ctx, Collector_Report_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_Report_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[ReportRequest, ReportResponse]{ClientStream: stream}
+	return x, nil
 }
 
-func (c *collectorClient) ReportBatch(ctx context.Context, in *ReportBatchRequest, opts ...grpc.CallOption) (*ReportResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReportResponse)
-	err := c.cc.Invoke(ctx, Collector_ReportBatch_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_ReportClient = grpc.ClientStreamingClient[ReportRequest, ReportResponse]
 
-// CollectorServer is the server API for Collector service.
-// All implementations must embed UnimplementedCollectorServer
+// AgentServiceServer is the server API for AgentService service.
+// All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility.
-type CollectorServer interface {
-	Report(context.Context, *ReportRequest) (*ReportResponse, error)
-	ReportBatch(context.Context, *ReportBatchRequest) (*ReportResponse, error)
-	mustEmbedUnimplementedCollectorServer()
+type AgentServiceServer interface {
+	Report(grpc.ClientStreamingServer[ReportRequest, ReportResponse]) error
+	mustEmbedUnimplementedAgentServiceServer()
 }
 
-// UnimplementedCollectorServer must be embedded to have
+// UnimplementedAgentServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedCollectorServer struct{}
+type UnimplementedAgentServiceServer struct{}
 
-func (UnimplementedCollectorServer) Report(context.Context, *ReportRequest) (*ReportResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Report not implemented")
+func (UnimplementedAgentServiceServer) Report(grpc.ClientStreamingServer[ReportRequest, ReportResponse]) error {
+	return status.Error(codes.Unimplemented, "method Report not implemented")
 }
-func (UnimplementedCollectorServer) ReportBatch(context.Context, *ReportBatchRequest) (*ReportResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReportBatch not implemented")
-}
-func (UnimplementedCollectorServer) mustEmbedUnimplementedCollectorServer() {}
-func (UnimplementedCollectorServer) testEmbeddedByValue()                   {}
+func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
+func (UnimplementedAgentServiceServer) testEmbeddedByValue()                      {}
 
-// UnsafeCollectorServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to CollectorServer will
+// UnsafeAgentServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AgentServiceServer will
 // result in compilation errors.
-type UnsafeCollectorServer interface {
-	mustEmbedUnimplementedCollectorServer()
+type UnsafeAgentServiceServer interface {
+	mustEmbedUnimplementedAgentServiceServer()
 }
 
-func RegisterCollectorServer(s grpc.ServiceRegistrar, srv CollectorServer) {
-	// If the following call panics, it indicates UnimplementedCollectorServer was
+func RegisterAgentServiceServer(s grpc.ServiceRegistrar, srv AgentServiceServer) {
+	// If the following call panics, it indicates UnimplementedAgentServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&Collector_ServiceDesc, srv)
+	s.RegisterService(&AgentService_ServiceDesc, srv)
 }
 
-func _Collector_Report_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(CollectorServer).Report(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Collector_Report_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(CollectorServer).Report(ctx, req.(*ReportRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+func _AgentService_Report_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(AgentServiceServer).Report(&grpc.GenericServerStream[ReportRequest, ReportResponse]{ServerStream: stream})
 }
 
-func _Collector_ReportBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportBatchRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(CollectorServer).ReportBatch(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Collector_ReportBatch_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(CollectorServer).ReportBatch(ctx, req.(*ReportBatchRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_ReportServer = grpc.ClientStreamingServer[ReportRequest, ReportResponse]
 
-// Collector_ServiceDesc is the grpc.ServiceDesc for Collector service.
+// AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var Collector_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "agent.v1.Collector",
-	HandlerType: (*CollectorServer)(nil),
-	Methods: []grpc.MethodDesc{
+var AgentService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "agent.v1.AgentService",
+	HandlerType: (*AgentServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
 		{
-			MethodName: "Report",
-			Handler:    _Collector_Report_Handler,
-		},
-		{
-			MethodName: "ReportBatch",
-			Handler:    _Collector_ReportBatch_Handler,
+			StreamName:    "Report",
+			Handler:       _AgentService_Report_Handler,
+			ClientStreams: true,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
 	Metadata: "internal/proto/agent/v1/agent.proto",
 }

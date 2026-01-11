@@ -203,14 +203,59 @@ export interface HealthResponse {
   timestamp: string;
 }
 
-async function request<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_PREFIX}${path}`);
+
+let authToken: string | null = null;
+
+export const setAuthToken = (token: string | null) => {
+  authToken = token;
+};
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers);
+  if (authToken) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
+
+  const response = await fetch(`${API_PREFIX}${path}`, {
+    ...options,
+    headers,
+  });
+
+  if (response.status === 401) {
+    // Optional: Global logout trigger could go here if we had access to history/context
+    // For now, just throw
+    throw new Error("Unauthorized");
+  }
+
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || `Request failed with ${response.status}`);
   }
   return response.json();
 }
+
+export interface AgentInfo {
+  name: string;
+  baseUrl: string;
+  status: string;
+  lastScrapeTime: string;
+  error?: string;
+  clusterId?: string;
+  nodeName?: string;
+}
+
+export const fetchAgents = async (): Promise<AgentInfo[]> => {
+  return request<AgentInfo[]>("/agents");
+};
+
+export const login = async (username: string, password: string): Promise<{ token: string }> => {
+  const resp = await request<{ token: string }>("/login", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+    headers: { "Content-Type": "application/json" },
+  });
+  return resp;
+};
 
 export const fetchOverview = async (): Promise<OverviewResponse> => {
   const resp = await request<OverviewResponseApi>("/cost/overview");

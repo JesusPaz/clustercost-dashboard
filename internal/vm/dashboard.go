@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -201,6 +202,11 @@ func (c *Client) Resources(ctx context.Context) (store.ResourcesPayload, error) 
 		return store.ResourcesPayload{}, err
 	}
 
+	// Fetch Network Metrics
+	netTx, _, _ := c.scalarMetric(ctx, "clustercost_cluster_network_tx_bytes_total")
+	netRx, _, _ := c.scalarMetric(ctx, "clustercost_cluster_network_rx_bytes_total")
+	netEgress, _, _ := c.scalarMetric(ctx, "clustercost_cluster_network_egress_cost_total")
+
 	namespaces, _, nsErr := c.namespaceMetrics(ctx, "", "")
 	if nsErr != nil && nsErr != ErrNoData {
 		return store.ResourcesPayload{}, nsErr
@@ -249,6 +255,11 @@ func (c *Client) Resources(ctx context.Context) (store.ResourcesPayload, error) 
 			RequestBytes:             int64(memRequest),
 			EfficiencyPercent:        memEfficiency,
 			EstimatedHourlyWasteCost: memWasteCost,
+		},
+		Network: store.NetworkResource{
+			TxBytesTotal:     int64(netTx),
+			RxBytesTotal:     int64(netRx),
+			EgressCostHourly: netEgress,
 		},
 		NamespaceWaste: buildNamespaceWaste(namespaces),
 	}, nil
@@ -312,13 +323,23 @@ func (c *Client) AgentStatus(ctx context.Context) (store.AgentStatusPayload, err
 func (c *Client) Agents(ctx context.Context) ([]store.AgentInfo, error) {
 	clusterID := c.resolveClusterID(ctx)
 	ctx = WithClusterID(ctx, clusterID)
-	agentSamples, err := c.seriesTimestamp(ctx, "clustercost_agent_up", nil)
+
+	// Explicitly query for agents active in the last 24 hours
+	expr := "max_over_time(timestamp(clustercost_agent_up)[24h])"
+	samples, err := c.query(ctx, expr)
 	if err != nil && err != ErrNoData {
 		return nil, err
 	}
 
+	for idx := range samples {
+		samples[idx].timestamp = time.Unix(int64(samples[idx].value), 0)
+	}
+	agentSamples := samples
+
+	configuredNames := make(map[string]bool)
 	agentMap := make(map[string]store.AgentInfo)
 	for _, cfg := range c.agents {
+		configuredNames[cfg.Name] = true
 		agentMap[cfg.Name] = store.AgentInfo{
 			Name:    cfg.Name,
 			BaseURL: cfg.BaseURL,
@@ -328,13 +349,21 @@ func (c *Client) Agents(ctx context.Context) ([]store.AgentInfo, error) {
 
 	now := time.Now()
 	for _, sample := range agentSamples {
+		// Try agent_id first, fallback to cluster_id or just "unknown"
 		name := sample.labels["agent_id"]
 		if name == "" {
-			continue
+			name = sample.labels["cluster_id"]
 		}
+		if name == "" {
+			continue // skip samples without identification
+		}
+
 		info := agentMap[name]
 		info.Name = name
 		info.LastScrapeTime = sample.timestamp
+		info.ClusterID = sample.labels["cluster_id"]
+		info.NodeName = sample.labels["node"]
+
 		if sample.timestamp.IsZero() {
 			info.Status = "unknown"
 		} else if now.Sub(sample.timestamp) > agentOfflineThreshold {
@@ -347,6 +376,16 @@ func (c *Client) Agents(ctx context.Context) ([]store.AgentInfo, error) {
 
 	result := make([]store.AgentInfo, 0, len(agentMap))
 	for _, info := range agentMap {
+		// Filter: only include agents seen in the last 24 hours or configured statically
+		if time.Since(info.LastScrapeTime) > 24*time.Hour && info.Status == "unknown" {
+			// If it's a static agent that we haven't seen, deciding whether to keep it.
+			// The user asked for "show only agents connected in last 24h".
+			// So, if it's static ("unknown") and no data, maybe exclude?
+			// But for now, let's keep static configs if they exist, but definitely filter out dynamic ones that are too old.
+			if !configuredNames[info.Name] {
+				continue
+			}
+		}
 		result = append(result, info)
 	}
 
@@ -400,23 +439,31 @@ func (c *Client) namespaceMetrics(ctx context.Context, environment, namespace st
 		labels["namespace"] = namespace
 	}
 
+	// We use pod metrics and aggregate them on the fly
 	metrics := []struct {
 		name   string
+		agg    string // "sum" or "count"
 		assign func(entry *store.NamespaceSummary, value float64)
 	}{
-		{"clustercost_namespace_hourly_cost", func(e *store.NamespaceSummary, v float64) { e.HourlyCost = v }},
-		{"clustercost_namespace_pod_count", func(e *store.NamespaceSummary, v float64) { e.PodCount = int(v) }},
-		{"clustercost_namespace_cpu_request_milli", func(e *store.NamespaceSummary, v float64) { e.CPURequestMilli = int64(v) }},
-		{"clustercost_namespace_cpu_usage_milli", func(e *store.NamespaceSummary, v float64) { e.CPUUsageMilli = int64(v) }},
-		{"clustercost_namespace_memory_request_bytes", func(e *store.NamespaceSummary, v float64) { e.MemoryRequestBytes = int64(v) }},
-		{"clustercost_namespace_memory_usage_bytes", func(e *store.NamespaceSummary, v float64) { e.MemoryUsageBytes = int64(v) }},
+		{"clustercost_pod_hourly_cost", "sum", func(e *store.NamespaceSummary, v float64) { e.HourlyCost = v }},
+		{"clustercost_pod_hourly_cost", "count", func(e *store.NamespaceSummary, v float64) { e.PodCount = int(v) }},
+		{"clustercost_pod_cpu_request_milli", "sum", func(e *store.NamespaceSummary, v float64) { e.CPURequestMilli = int64(v) }},
+		{"clustercost_pod_cpu_usage_milli", "sum", func(e *store.NamespaceSummary, v float64) { e.CPUUsageMilli = int64(v) }},
+		{"clustercost_pod_memory_request_bytes", "sum", func(e *store.NamespaceSummary, v float64) { e.MemoryRequestBytes = int64(v) }},
+		{"clustercost_pod_memory_usage_bytes", "sum", func(e *store.NamespaceSummary, v float64) { e.MemoryUsageBytes = int64(v) }},
 	}
 
 	out := make(map[string]*store.NamespaceSummary)
 	var latest time.Time
 
+	// Regex to identify UUID-like strings (which are likely garbage/incorrect namespaces)
+	uuidPattern := regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
+
 	for _, metric := range metrics {
-		expr := fmt.Sprintf("sum by (namespace, environment) (%s)", c.lookbackExpr(metric.name, labels, clusterID))
+		// e.g. sum by (namespace, environment) (last_over_time(clustercost_pod_hourly_cost{...}[1h]))
+		// Note: lookbackExpr returns "last_over_time(metric{...}[lookback])"
+		// We wrap that in the aggregation.
+		expr := fmt.Sprintf("%s by (namespace, environment) (%s)", metric.agg, c.lookbackExpr(metric.name, labels, clusterID))
 		samples, err := c.query(ctx, expr)
 		if err != nil {
 			return nil, time.Time{}, err
@@ -426,6 +473,11 @@ func (c *Client) namespaceMetrics(ctx context.Context, environment, namespace st
 			if ns == "" {
 				continue
 			}
+			// Filter out UUID-like namespaces as they are likely misreported or noise
+			if uuidPattern.MatchString(ns) {
+				continue
+			}
+
 			env := sample.labels["environment"]
 			key := namespaceKey(ns, env)
 			entry := out[key]
@@ -441,7 +493,7 @@ func (c *Client) namespaceMetrics(ctx context.Context, environment, namespace st
 		}
 	}
 
-	latest = c.seriesTimestampSafe(ctx, "clustercost_namespace_hourly_cost")
+	latest = c.seriesTimestampSafe(ctx, "clustercost_pod_hourly_cost")
 	return out, latest, nil
 }
 

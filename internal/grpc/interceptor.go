@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"log"
 	"strings"
 
 	"github.com/clustercost/clustercost-dashboard/internal/config"
@@ -34,18 +35,23 @@ func NewAuthInterceptor(agents []config.AgentConfig, defaultToken string) *AuthI
 // Unary returns a UnaryServerInterceptor that validates the token.
 func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		log.Printf("[gRPC] Received request: %s", info.FullMethod)
+
 		if len(i.validTokens) == 0 && i.defaultToken == "" {
+			log.Println("[gRPC] No tokens configured, allowing unauthenticated request")
 			// If no tokens are configured, allow unauthenticated access.
 			return handler(ctx, req)
 		}
 
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok {
+			log.Println("[gRPC] Auth failed: no metadata")
 			return nil, status.Error(codes.Unauthenticated, "metadata is not provided")
 		}
 
 		values := md["authorization"]
 		if len(values) == 0 {
+			log.Println("[gRPC] Auth failed: no authorization header")
 			return nil, status.Error(codes.Unauthenticated, "authorization token is not provided")
 		}
 
@@ -53,6 +59,7 @@ func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 
 		// Check default token first
 		if i.defaultToken != "" && accessToken == i.defaultToken {
+			log.Println("[gRPC] Authenticated with default token")
 			// If default token is used, we might not know the agent name yet.
 			// It will be extracted from the request body in the handler.
 			return handler(ctx, req)
@@ -61,11 +68,13 @@ func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 		// Check specific agent tokens
 		agentName, ok := i.validTokens[accessToken]
 		if ok {
+			log.Printf("[gRPC] Authenticated agent: %s", agentName)
 			// Inject agent name into context
 			newCtx := context.WithValue(ctx, "agent_name", agentName)
 			return handler(newCtx, req)
 		}
 
+		log.Printf("[gRPC] Auth failed: invalid token")
 		return nil, status.Error(codes.Unauthenticated, "invalid token")
 	}
 }
