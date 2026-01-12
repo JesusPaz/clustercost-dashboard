@@ -1,73 +1,95 @@
 package store
 
-// Pricing constants (simplified for this exercise)
-const (
-	// Default prices if not found in catalog
-	DefaultCPUCostPerHour    = 0.031611 // per vCPU
-	DefaultMemoryCostPerHour = 0.004237 // per GB
+import "context"
 
-	// Egress costs
-	CostEgressPublic   = 0.09 // per GB
-	CostEgressCrossAZ  = 0.01 // per GB
+// Pricing constants
+const (
+	// Egress costs (public internet)
+	CostEgressPublic   = 0.09 // $0.09 per GB
+	CostEgressCrossAZ  = 0.01 // $0.01 per GB
 	CostEgressInternal = 0.00 // Free
 )
 
-// PricingCatalog allows looking up node prices.
-// In a real generic version, this might load from a JSON file or API.
-type PricingCatalog struct{}
-
-func (pc *PricingCatalog) GetNodePrice(nodeName, zone string) (cpuPerHour, memPerHour float64) {
-	// TODO: unique lookups based on instance types if we had them.
-	// For now, return standard cloud defaults.
-	return DefaultCPUCostPerHour, DefaultMemoryCostPerHour
+// PricingProvider defines the interface for fetching node pricing.
+type PricingProvider interface {
+	GetNodePrice(ctx context.Context, region, instanceType string) (float64, error)
 }
 
-func calculatePodCost(cpuSeconds, memByteSeconds, publicBytes, crossAZBytes, internalBytes float64, cpuPrice, memPrice float64) float64 {
-	// This function might need to be adapted depending on what metrics we receive:
-	// The proto CpuMetrics has usage_user_ns (nanoseconds).
-	// The proto MemoryMetrics has rss_bytes.
+// PricingCatalog allows looking up node prices.
+type PricingCatalog struct {
+	// Map instance type to hourly price
+	InstancePrices map[string]float64
+	Provider       PricingProvider
+}
 
-	// BUT wait, "Hourly Cost" is usually Rate * Usage.
-	// If we are showing "Hourly Cost" as a *rate* based on current usage:
-	// Cost/Hr = (Cores_Used * Price/Core/Hr) + (GB_Used * Price/GB/Hr)
+// NewPricingCatalog returns a catalog with some default mocked pricing.
+func NewPricingCatalog(provider PricingProvider) *PricingCatalog {
+	return &PricingCatalog{
+		InstancePrices: map[string]float64{
+			"t3.medium": 0.0416,
+			"t3.large":  0.0832,
+			"m5.large":  0.096,
+			"m5.xlarge": 0.192,
+			"c5.large":  0.085,
+			"r5.large":  0.126,
+			"default":   0.05, // Fallback
+		},
+		Provider: provider,
+	}
+}
 
-	// Network cost is usually per GB. So "Hourly Cost" for network implies we infer a rate?
-	// Or do we just sum up the costs for the period?
-	// The Dashboard seems to show "Restimated Hourly Cost".
-	// So we take the current Instantaneous Usage and multiply by Hourly Price.
+// GetTotalNodePrice returns the total hourly cost of a node.
+func (pc *PricingCatalog) GetTotalNodePrice(ctx context.Context, region, instanceType string) float64 {
+	// Try Provider first
+	if pc.Provider != nil && instanceType != "" && region != "" {
+		price, err := pc.Provider.GetNodePrice(ctx, region, instanceType)
+		if err == nil && price > 0 {
+			pc.InstancePrices[instanceType] = price // Update cache
+			return price
+		}
+	}
 
-	// For Network, since it's a counter (bytes_sent), we can't easily get "Hourly Rate" without rate calculation over time.
-	// However, the `NetworkMetrics` in proto has `egress_public_bytes`. This is a cumulative counter?
-	// "The Agent ... streams raw telemetry ... simplified Protobuf schema".
-	// Usually counters increase. Creating "Hourly Cost" from a counter requires a rate.
-	// For this refactor, I will start by focusing on CPU/RAM which are gauges (implicitly, usage_ns is a counter but we might get a rate or just use the snapshot to infer 'active' load if we diff?
-	// Wait, `usage_user_ns` is a counter. `rss_bytes` is a gauge.
+	// Fallback to local cache
+	price, ok := pc.InstancePrices[instanceType]
+	if !ok {
+		price = pc.InstancePrices["default"]
+	}
+	return price
+}
 
-	// User Instructions:
-	// "Calculate costs: (CPU_Usage * Node_CPU_Price) + (RAM_Usage * Node_RAM_Price) + (Egress_Public * Public_Price) + ..."
+// GetNodeResourcePrices calculates the cost per vCPU and per GB of RAM based on the instance type.
+// Policy: 50% of instance cost allocated to CPU, 50% allocated to RAM.
+func (pc *PricingCatalog) GetNodeResourcePrices(ctx context.Context, region, instanceType string, vCPUs int64, ramBytes int64) (cpuPricePerCore, ramPricePerGB float64) {
+	totalHourlyPrice := pc.GetTotalNodePrice(ctx, region, instanceType)
 
-	// Implementation detail: The Receiver receives a STREAM of reports.
-	// If I only keep the *latest* snapshot, I have the latest counter values.
-	// I can't calculate rate from a single point unless the agent sends rate.
-	// Proto says `usage_user_ns`. That is cumulative.
+	if vCPUs <= 0 {
+		vCPUs = 2 // Default fallback
+	}
+	if ramBytes <= 0 {
+		ramBytes = 4 * 1024 * 1024 * 1024 // Default fallback 4GB
+	}
+	ramGB := float64(ramBytes) / (1024 * 1024 * 1024)
 
-	// Maybe checking `CpuMetrics` in `agent.proto`. `uint64 usage_user_ns = 1;`
-	// Without a previous point, I cannot calculate usage *rate* (CPU %).
-	// BUT the Dashboard expects "HourlyCost".
-	//
-	// HYPOTHESIS: The agent might be sending a "delta" or the receiver needs to track previous state to calculate rate.
-	// OR, I should just implement the structure and logic assuming I can get the rate.
-	//
-	// Let's look at `store.go` again. `Snapshot` had `LastScrape`.
-	// Functional requirement: "It no longer calculates costs ... streams raw telemetry".
-	//
-	// For the purpose of this task, I will try to implement a stateful store that keeps the *previous* report to calculate CPU rates.
-	//
-	// Actually, looking at the previous implementation, `AgentSnapshot` was just a holder for the last JSON.
-	// If I want to support CPU usage % and Cost, I MUST calculate the rate.
-	// `Rate = (CurrentNS - PrevNS) / (CurrentTime - PrevTime)`.
-	//
-	// I will add `PreviousReport` to `AgentSnapshot` to allow rate calculation.
+	// User Policy: "Divide precio de instancia entre dos, mitad cpu y mitad ram"
+	cpuPoolCost := totalHourlyPrice * 0.5
+	ramPoolCost := totalHourlyPrice * 0.5
 
-	return 0.0
+	cpuPricePerCore = cpuPoolCost / float64(vCPUs)
+	ramPricePerGB = ramPoolCost / ramGB
+
+	return cpuPricePerCore, ramPricePerGB
+}
+
+// Estimated Cost Calculation
+// This calculates the *rate* of spend based on current usage.
+// cpuUsageCores: Number of cores currently being used (e.g. 0.5 for 500m)
+// memUsageGB: Amount of RAM currently used in GB
+// monthlyEgressGB: Estimated monthly egress based on current rate/counter
+func calculateHourlyCost(cpuUsageCores, memUsageGB, egressPublicGB, egressCrossAZGB float64, cpuPrice, memPrice float64) float64 {
+	computeCost := (cpuUsageCores * cpuPrice)
+	memoryCost := (memUsageGB * memPrice)
+
+	networkCost := (egressPublicGB * CostEgressPublic) + (egressCrossAZGB * CostEgressCrossAZ)
+
+	return computeCost + memoryCost + networkCost
 }

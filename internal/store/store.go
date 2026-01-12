@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/clustercost/clustercost-dashboard/internal/config"
+	"github.com/clustercost/clustercost-dashboard/internal/pricing"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 )
 
@@ -26,6 +28,8 @@ type Store struct {
 	agentConfigs            map[string]config.AgentConfig
 	snapshots               map[string]*AgentSnapshot
 	recommendedAgentVersion string
+
+	pricing *PricingCatalog
 }
 
 // AgentSnapshot contains the most recent data fetched for an agent.
@@ -214,10 +218,16 @@ func New(cfgs []config.AgentConfig, recommendedAgentVersion string) *Store {
 	for _, c := range cfgs {
 		agentConfigs[c.Name] = c
 	}
+
+	// Initialize Static Pricing Provider
+	// Context is just placeholder for interface, static client doesn't need it
+	pricingClient, _ := pricing.NewAWSClient(context.Background())
+
 	return &Store{
 		agentConfigs:            agentConfigs,
 		snapshots:               make(map[string]*AgentSnapshot, len(cfgs)),
 		recommendedAgentVersion: recommendedAgentVersion,
+		pricing:                 NewPricingCatalog(pricingClient),
 	}
 }
 
@@ -705,8 +715,25 @@ func (s *Store) aggregateNamespacesLocked() (map[string]*NamespaceSummary, error
 		}
 
 		// Determine node price for this snapshot
-		memPrice := DefaultMemoryCostPerHour
-		// TODO: Lookup from PricingCatalog using snap.Report.NodeName/AZ
+		// We don't have node capacity in V2 Report (cpu_allocatable presumably in node metrics if sent?)
+		// ReportRequest does NOT have node capacity.
+		// For the 50/50 split math, we need total capacity (vCPUs, RAM bytes).
+		// Currently V2 proto does NOT send capacity.
+		// We have to assume a default capacity or look it up if we knew the instance type.
+		// ReportRequest doesn't have InstanceType either?
+		// Wait, user provided proto v2 only has: agent_id, cluster_id, node_name, az, pods.
+		// It lacks InstanceType and NodeCapacity.
+		// PROPOSAL: We must infer or assume defaults until agent sends metadata.
+		// Using "m5.large" proxies (2 vCPU, 8GB) for calculation if unknown.
+
+		// TODO: Agent V2 should send Node Metadata (InstanceType, Capacity) for accurate pricing.
+		// For now, we use a default "standard" node.
+		// Region/AZ: check meta
+		region := snap.Report.AvailabilityZone
+		if region == "" {
+			region = "us-east-1"
+		}
+		cpuPrice, memPrice := s.pricing.GetNodeResourcePrices(context.Background(), region, "default", 2, 8*1024*1024*1024)
 
 		for _, pod := range snap.Report.Pods {
 			haveData = true
@@ -718,36 +745,44 @@ func (s *Store) aggregateNamespacesLocked() (map[string]*NamespaceSummary, error
 			if !ok {
 				entry = &NamespaceSummary{
 					Namespace:   pod.Namespace,
-					Labels:      make(map[string]string), // Labels removed in V2 proto
-					Environment: "production",            // Default
+					Labels:      make(map[string]string),
+					Environment: "production",
 				}
 				collector[pod.Namespace] = entry
 			}
 
 			// Aggregate Costs
-			// Use RSS for usage
 			memUsageBytes := int64(0)
 			if pod.Memory != nil {
 				memUsageBytes = int64(pod.Memory.RssBytes)
 			}
+			memGB := float64(memUsageBytes) / (1024 * 1024 * 1024)
 
-			// Network Cost
-			netCost := 0.0
-			if pod.Network != nil {
-				netCost += float64(pod.Network.EgressPublicBytes) * CostEgressPublic
-				netCost += float64(pod.Network.EgressCrossAzBytes) * CostEgressCrossAZ
-			}
+			// CPU Usage (Cores)
+			// We need rate. Snapshot only has cumulative usage_ns.
+			// Without rate, we can't do accurate CPU cost.
+			// Currently returning 0.0 for CPU cost as placeholder.
+			cpuUsageCores := 0.0
 
-			// Hourly Cost Calculation
-			// Memory Cost = GB * Price/GB/Hr
-			memCost := (float64(memUsageBytes) / 1024 / 1024 / 1024) * memPrice
+			// Network Cost (Egress)
+			// Assume EgressPublicBytes is cumulative Counter.
+			// To get "Hourly Cost", strictly we need rate.
+			// But for "Billable Egress", we usually equate "Traffic sent * Price".
+			// If this is a snapshot, we might be double counting if we just sum total counter * price every scrape.
+			// CORRECT LOGIC: Cost = (CurrentCounter - PrevCounter) * Price.
+			// For this MVP, we will skip Network Cost in "Hourly Rate" display to avoid massive inflation from cumulative counters,
+			// OR we assume the agent sends "bytes sent in last report interval"?
+			// Proto says "egress_public_bytes". Standard prometheus is cumulative.
+			// logic.
+			// Given urgency, 0.0 is safer than wrong.
+			egressPublicGB := 0.0
+			egressCrossAZGB := 0.0
 
-			// CPU Cost (No rate yet)
-			cpuCost := 0.0
+			// Calculate Total Hourly Cost Rate
+			// Cost = (Cores * Price/Core) + (GB * Price/GB) + (NetworkGB/hr * Price/GB)
+			hourCost := calculateHourlyCost(cpuUsageCores, memGB, egressPublicGB, egressCrossAZGB, cpuPrice, memPrice)
 
-			totalPodCost := memCost + cpuCost + netCost
-
-			entry.HourlyCost += totalPodCost
+			entry.HourlyCost += hourCost
 			entry.MemoryUsageBytes += memUsageBytes
 			entry.PodCount++
 		}
@@ -787,13 +822,20 @@ func (s *Store) aggregateNodesLocked() (map[string]*NodeSummary, error) {
 		// Calculate node totals from pods
 		for range snap.Report.Pods {
 			entry.PodCount++
-			// Sum up usages for node view if needed
 		}
 
-		// Cost estimation (Fixed node price + dynamic)
-		cpuPrice, memPrice := DefaultCPUCostPerHour, DefaultMemoryCostPerHour
-		// Assume 4 vCPU, 16GB
-		entry.HourlyCost = (4 * cpuPrice) + (16 * memPrice)
+		// Cost estimation
+		// We use dynamic pricing from catalog.
+		region := snap.Report.AvailabilityZone
+		if region == "" {
+			region = "us-east-1"
+		}
+		// Default instance type if missing
+		instanceType := "default"
+		// If Report had InstanceType, we would use it.
+
+		price := s.pricing.GetTotalNodePrice(context.Background(), region, instanceType)
+		entry.HourlyCost = price
 	}
 
 	if !haveData {

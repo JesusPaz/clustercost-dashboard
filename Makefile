@@ -1,4 +1,7 @@
-.PHONY: backend frontend build docker test clean dev-backend dev-frontend dev-bundle
+.PHONY: backend frontend build docker test clean dev-backend dev-frontend dev-bundle generate-pricing
+
+generate-pricing:
+	go run scripts/generate_pricing.go
 
 BACKEND_ENV ?= LISTEN_ADDR=:9010
 AGENT_URLS ?=

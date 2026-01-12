@@ -23,6 +23,8 @@ COPY web/tailwind.config.cjs web/postcss.config.cjs web/vite.config.ts web/tscon
 COPY web/src ./web/src
 COPY --from=frontend /app/web/dist ./web/dist
 RUN mkdir -p internal/static && rm -rf internal/static/dist && cp -r web/dist internal/static/dist
+COPY scripts ./scripts
+RUN go run scripts/generate_pricing.go
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /dashboard ./cmd/dashboard
 
 FROM --platform=$TARGETPLATFORM gcr.io/distroless/base-debian12:nonroot
