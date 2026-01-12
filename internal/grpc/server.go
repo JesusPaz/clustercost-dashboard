@@ -7,6 +7,7 @@ import (
 
 	"github.com/clustercost/clustercost-dashboard/internal/config"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
+	"github.com/clustercost/clustercost-dashboard/internal/store"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
@@ -15,7 +16,7 @@ type Server struct {
 	grpcServer *grpc.Server
 }
 
-func NewServer(cfg config.Config, ingestor ReportIngestor) *Server {
+func NewServer(cfg config.Config, ingestor ReportIngestor, st *store.Store) *Server {
 	auth := NewAuthInterceptor(cfg.Agents, cfg.DefaultAgentToken)
 
 	opts := []grpc.ServerOption{
@@ -24,7 +25,7 @@ func NewServer(cfg config.Config, ingestor ReportIngestor) *Server {
 
 	gsrv := grpc.NewServer(opts...)
 
-	collector := NewCollector(ingestor)
+	collector := NewCollector(ingestor, st)
 	agentv1.RegisterCollectorServer(gsrv, collector)
 
 	// Register reflection service on gRPC server (useful for grpcurl).

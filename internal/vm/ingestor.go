@@ -286,16 +286,24 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 		// Calculate Totals and Costs
 		// CPU
 		cpuSeconds := float64(0)
+		cpuReq := int64(0)
+		cpuLim := int64(0)
 		if pod.Cpu != nil {
 			// usage_user_ns + usage_kernel_ns
 			ns := pod.Cpu.UsageUserNs + pod.Cpu.UsageKernelNs
 			cpuSeconds = float64(ns) / 1e9
+			cpuReq = int64(pod.Cpu.RequestMillicores)
+			cpuLim = int64(pod.Cpu.LimitMillicores)
 		}
 
 		// Memory
 		memBytes := int64(0)
+		memReq := int64(0)
+		memLim := int64(0)
 		if pod.Memory != nil {
 			memBytes = int64(pod.Memory.RssBytes)
+			memReq = int64(pod.Memory.RequestBytes)
+			memLim = int64(pod.Memory.LimitBytes)
 		}
 
 		// Network
@@ -309,7 +317,13 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 		}
 
 		writeSample(buf, "clustercost_pod_cpu_usage_seconds_total", podLabels, formatFloat(cpuSeconds), tsMillis)
+		writeSample(buf, "clustercost_pod_cpu_request_millicores", podLabels, formatInt(cpuReq), tsMillis)
+		writeSample(buf, "clustercost_pod_cpu_limit_millicores", podLabels, formatInt(cpuLim), tsMillis)
+
 		writeSample(buf, "clustercost_pod_memory_rss_bytes", podLabels, formatInt(memBytes), tsMillis)
+		writeSample(buf, "clustercost_pod_memory_request_bytes", podLabels, formatInt(memReq), tsMillis)
+		writeSample(buf, "clustercost_pod_memory_limit_bytes", podLabels, formatInt(memLim), tsMillis)
+
 		writeSample(buf, "clustercost_pod_network_tx_bytes_total", podLabels, formatInt(netTx), tsMillis)
 		writeSample(buf, "clustercost_pod_network_rx_bytes_total", podLabels, formatInt(netRx), tsMillis)
 		writeSample(buf, "clustercost_pod_network_egress_public_bytes_total", podLabels, formatInt(egressPublic), tsMillis)

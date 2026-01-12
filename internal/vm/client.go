@@ -333,3 +333,71 @@ func (c *Client) scopedLabels(labels map[string]string, clusterID string) map[st
 	}
 	return labels
 }
+
+// GetPodP95Usage returns the 95th percentile of CPU and Memory usage for a specific pod over the lookback period.
+// cpu is in cores, memory is in bytes.
+func (c *Client) GetPodP95Usage(ctx context.Context, clusterID, namespace, podName string) (cpuCores float64, memoryBytes float64, err error) {
+	// Construct labels for specific pod
+	labels := map[string]string{
+		"namespace": namespace,
+		"pod":       podName,
+	}
+	if clusterID != "" {
+		labels["cluster_id"] = clusterID
+	}
+
+	// CPU Query: quantile_over_time(0.95, rate(clustercost_pod_cpu_usage_seconds_total{...}[10s])[1h])
+	// We use the configured lookback for the outer range.
+	// Rate interval is hardcoded to 1m for smoothness, or matched to scrape interval.
+	cpuQuery := fmt.Sprintf("quantile_over_time(0.95, rate(clustercost_pod_cpu_usage_seconds_total%s[1m])[%s])",
+		formatLabels(labels), c.lookback.String())
+
+	// Memory Query: quantile_over_time(0.95, clustercost_pod_memory_rss_bytes{...}[1h])
+	memQuery := fmt.Sprintf("quantile_over_time(0.95, clustercost_pod_memory_rss_bytes%s[%s])",
+		formatLabels(labels), c.lookback.String())
+
+	// Execute CPU query
+	cpuSamples, err := c.query(ctx, cpuQuery)
+	if err != nil {
+		return 0, 0, fmt.Errorf("query cpu p95: %w", err)
+	}
+	if len(cpuSamples) > 0 {
+		cpuCores = cpuSamples[0].value
+	}
+
+	// Execute Memory query
+	memSamples, err := c.query(ctx, memQuery)
+	if err != nil {
+		return 0, 0, fmt.Errorf("query memory p95: %w", err)
+	}
+	if len(memSamples) > 0 {
+		memoryBytes = memSamples[0].value
+	}
+
+	return cpuCores, memoryBytes, nil
+}
+
+func formatLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteString(`="`)
+		b.WriteString(labels[k]) // Simple escape for now, assume safe chars
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	return b.String()
+}

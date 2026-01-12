@@ -11,8 +11,10 @@ import (
 	"github.com/clustercost/clustercost-dashboard/internal/auth"
 	"github.com/clustercost/clustercost-dashboard/internal/config"
 	"github.com/clustercost/clustercost-dashboard/internal/db"
+	"github.com/clustercost/clustercost-dashboard/internal/finops"
 	ccgrpc "github.com/clustercost/clustercost-dashboard/internal/grpc"
 	"github.com/clustercost/clustercost-dashboard/internal/logging"
+	"github.com/clustercost/clustercost-dashboard/internal/store"
 	"github.com/clustercost/clustercost-dashboard/internal/vm"
 )
 
@@ -38,11 +40,17 @@ func main() {
 	}
 	defer sqlite.Close()
 
+	// Initialize In-Memory Store
+	st := store.New(cfg.Agents, cfg.RecommendedAgentVersion)
+
+	// Initialize FinOps Engine
+	finopsEngine := finops.NewEngine(vmClient, st.PricingCatalog())
+
 	auth.SetSecret(cfg.JWTSecret)
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: api.NewRouter(vmClient, sqlite),
+		Handler: api.NewRouter(vmClient, sqlite, st, finopsEngine),
 	}
 
 	vmIngestor, err := vm.NewIngestor(cfg, logger)
@@ -54,7 +62,8 @@ func main() {
 		logger.Printf("victoria metrics ingest enabled")
 	}
 
-	grpcSrv := ccgrpc.NewServer(cfg, vmIngestor)
+	// Pass store to gRPC server so it can receive reports
+	grpcSrv := ccgrpc.NewServer(cfg, vmIngestor, st)
 	go func() {
 		logger.Printf("gRPC receiver initialized")
 		logger.Printf("gRPC listening on %s", cfg.GrpcAddr)

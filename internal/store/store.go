@@ -212,6 +212,15 @@ type NodeFilter struct {
 	Offset int
 }
 
+// PodContext wraps a PodMetric with its location metadata.
+type PodContext struct {
+	Pod          *agentv1.PodMetric
+	ClusterID    string
+	Region       string
+	AZ           string
+	InstanceType string
+}
+
 // New creates a store seeded with agent configurations.
 func New(cfgs []config.AgentConfig, recommendedAgentVersion string) *Store {
 	agentConfigs := make(map[string]config.AgentConfig, len(cfgs))
@@ -229,6 +238,11 @@ func New(cfgs []config.AgentConfig, recommendedAgentVersion string) *Store {
 		recommendedAgentVersion: recommendedAgentVersion,
 		pricing:                 NewPricingCatalog(pricingClient),
 	}
+}
+
+// PricingCatalog returns the pricing catalog used by the store.
+func (s *Store) PricingCatalog() *PricingCatalog {
+	return s.pricing
 }
 
 // Update stores the latest report for a given agent.
@@ -255,7 +269,42 @@ func (s *Store) Update(agentID string, req *agentv1.ReportRequest) {
 		PreviousReport: prev,
 		LastScrape:     now,
 		LastScrapeDur:  dur,
+		LastError:      "",
 	}
+}
+
+// GetAllPods returns all pods from all agents with their context.
+func (s *Store) GetAllPods() []PodContext {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var pods []PodContext
+	for agentID, snap := range s.snapshots {
+		if snap == nil || snap.Report == nil {
+			continue
+		}
+
+		region := snap.Report.Region
+		if region == "" {
+			// Fallback to config or default if missing in report
+			if cfg, ok := s.agentConfigs[agentID]; ok && cfg.Region != "" {
+				region = cfg.Region
+			} else {
+				region = "us-east-1"
+			}
+		}
+
+		for _, pod := range snap.Report.Pods {
+			pods = append(pods, PodContext{
+				Pod:          pod,
+				ClusterID:    snap.Report.ClusterId,
+				Region:       region,
+				AZ:           snap.Report.AvailabilityZone,
+				InstanceType: snap.Report.InstanceType,
+			})
+		}
+	}
+	return pods
 }
 
 // Overview aggregates cluster level information for the overview dashboard.
@@ -670,12 +719,18 @@ func (s *Store) latestAgentMetadataLocked() agentMetadata {
 			continue
 		}
 		ts := snap.LastScrape
+		// Prefer Region from report, fallback to AZ
+		region := snap.Report.Region
+		if region == "" {
+			region = snap.Report.AvailabilityZone
+		}
+
 		if meta.Timestamp.IsZero() || ts.After(meta.Timestamp) {
 			meta = agentMetadata{
 				ClusterID:   snap.Report.ClusterId,
-				ClusterName: "Cluster",                    // snap.Report.ClusterName removed in V2
-				ClusterType: "k8s",                        // Default for now
-				Region:      snap.Report.AvailabilityZone, // approximation
+				ClusterName: "Cluster",
+				ClusterType: "k8s",
+				Region:      region,
 				Version:     "v2.0",
 				Timestamp:   ts,
 			}

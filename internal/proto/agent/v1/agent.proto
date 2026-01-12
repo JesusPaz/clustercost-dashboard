@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package agent.v1;
 
-option go_package = "github.com/clustercost/backend/proto/agent/v1;agentv1";
+option go_package = "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1;agentv1";
 
 service Collector {
   // Report sends a batch of metrics from the agent to the aggregator.
@@ -15,8 +15,10 @@ message ReportRequest {
   string node_name = 3;
   string availability_zone = 4;
   int64 timestamp_seconds = 5;
+  string region = 6;
+  string instance_type = 7;
 
-  repeated PodMetric pods = 6;
+  repeated PodMetric pods = 8;
 }
 
 message ReportResponse {
@@ -30,6 +32,10 @@ message PodMetric {
   string container_id = 2;
   uint32 pid_tgid = 3;
   
+  // Include namespace/pod name to help aggregator if K8s API is lagging, 
+  // but strictly spec just says identifiers. 
+  // "The agent must resolve destination IPs..." -> Agent does heavy lifting for network.
+  // Let's keep namespace/name as they are cheap and useful.
   string namespace = 4;
   string pod_name = 5;
 
@@ -51,6 +57,10 @@ message CpuMetrics {
   uint64 usage_kernel_ns = 2;
   // Total run_delay (throttling) in nanoseconds
   uint64 throttling_ns = 3;
+  // K8s Requests (mCPU)
+  uint64 request_millicores = 4;
+  // K8s Limits (mCPU)
+  uint64 limit_millicores = 5;
 }
 
 message MemoryMetrics {
@@ -58,6 +68,10 @@ message MemoryMetrics {
   uint64 rss_bytes = 1;
   // Major page faults
   uint64 page_faults_major = 2;
+  // K8s Requests (bytes)
+  uint64 request_bytes = 3;
+  // K8s Limits (bytes)
+  uint64 limit_bytes = 4;
 }
 
 message NetworkMetrics {

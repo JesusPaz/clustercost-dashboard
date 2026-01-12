@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/clustercost/clustercost-dashboard/internal/config"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -17,14 +18,14 @@ import (
 func TestReport_Unary(t *testing.T) {
 	// Rename to TestReport_Unary
 	lis := bufconn.Listen(1024 * 1024)
-	s := grpc.NewServer(
-		grpc.UnaryInterceptor(NewAuthInterceptor(nil, "secret").Unary()),
-	)
-
 	// Mock ingestor
 	ingestor := &fakeIngestor{}
-	collector := NewCollector(ingestor)
-	agentv1.RegisterCollectorServer(s, collector)
+	// Use config.Config
+	cfg := config.Config{
+		DefaultAgentToken: "secret",
+	}
+	s := NewServer(cfg, ingestor, nil)
+	// NewServer registers collector internally.
 
 	go func() {
 		if err := s.Serve(lis); err != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/clustercost/clustercost-dashboard/internal/auth"
 	"github.com/clustercost/clustercost-dashboard/internal/db"
+	"github.com/clustercost/clustercost-dashboard/internal/finops"
 	"github.com/clustercost/clustercost-dashboard/internal/static"
 	"github.com/clustercost/clustercost-dashboard/internal/store"
 )
@@ -30,15 +31,19 @@ type MetricsProvider interface {
 
 // Handler wires HTTP requests to the VictoriaMetrics client.
 type Handler struct {
-	vm MetricsProvider
-	db *db.Store
+	vm     MetricsProvider
+	db     *db.Store
+	store  *store.Store
+	finops *finops.Engine
 }
 
 // NewRouter builds the HTTP router serving both JSON APIs and static assets.
-func NewRouter(vmClient MetricsProvider, db *db.Store) http.Handler {
+func NewRouter(vmClient MetricsProvider, db *db.Store, st *store.Store, finopsEngine *finops.Engine) http.Handler {
 	h := &Handler{
-		vm: vmClient,
-		db: db,
+		vm:     vmClient,
+		db:     db,
+		store:  st,
+		finops: finopsEngine,
 	}
 
 	r := chi.NewRouter()
@@ -71,6 +76,10 @@ func NewRouter(vmClient MetricsProvider, db *db.Store) http.Handler {
 			})
 			protected.Get("/agent", h.AgentStatus)
 			protected.Get("/agents", h.Agents)
+
+			protected.Route("/finops", func(finops chi.Router) {
+				finops.Get("/efficiency", h.EfficiencyReport)
+			})
 		})
 	})
 
