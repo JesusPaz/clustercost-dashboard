@@ -1,6 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { login as apiLogin, setAuthToken } from '@/lib/api';
+import { setAuthToken, setUnauthorizedHandler } from '@/lib/api';
 
 interface AuthContextType {
     isAuthenticated: boolean;
@@ -32,19 +32,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsLoading(false);
     }, []);
 
-    const login = (token: string) => {
+    const login = useCallback((token: string) => {
         localStorage.setItem('token', token);
         setAuthToken(token);
         setIsAuthenticated(true);
         navigate('/');
-    };
+    }, [navigate]);
 
-    const logout = () => {
+    const logout = useCallback(() => {
         localStorage.removeItem('token');
         setAuthToken(null);
         setIsAuthenticated(false);
         navigate('/login');
-    };
+    }, [navigate]);
+
+    useEffect(() => {
+        setUnauthorizedHandler(logout);
+        return () => setUnauthorizedHandler(null);
+    }, [logout]);
 
     return (
         <AuthContext.Provider value={{ isAuthenticated, login, logout, isLoading }}>

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -263,6 +264,138 @@ func (c *Client) Resources(ctx context.Context) (store.ResourcesPayload, error) 
 		},
 		NamespaceWaste: buildNamespaceWaste(namespaces),
 	}, nil
+}
+
+func (c *Client) NetworkTopology(ctx context.Context, opts store.NetworkTopologyOptions) ([]store.NetworkEdge, error) {
+	clusterID := opts.ClusterID
+	if clusterID == "" {
+		clusterID = c.resolveClusterID(ctx)
+	}
+	if clusterID == "" {
+		return nil, ErrNoData
+	}
+	ctx = WithClusterID(ctx, clusterID)
+
+	if opts.End.IsZero() {
+		opts.End = time.Now().UTC()
+	}
+	if opts.Start.IsZero() {
+		opts.Start = opts.End.Add(-c.lookback)
+	}
+
+	window := opts.End.Sub(opts.Start)
+	if window <= 0 {
+		window = c.lookback
+	}
+	windowStr := formatDuration(window)
+
+	labels := map[string]string{"cluster_id": clusterID}
+	groupLabels := []string{
+		"src_namespace",
+		"src_pod",
+		"src_node",
+		"src_ip",
+		"src_availability_zone",
+		"dst_namespace",
+		"dst_pod",
+		"dst_node",
+		"dst_ip",
+		"dst_availability_zone",
+		"dst_kind",
+		"service_match",
+		"dst_services",
+		"protocol",
+	}
+	groupBy := strings.Join(groupLabels, ",")
+
+	endSeconds := opts.End.UTC().Unix()
+
+	bytesSentExpr := connectionMetricExpr("clustercost_connection_bytes_sent_total", labels, opts.Namespace, windowStr, endSeconds, groupBy, "increase")
+	bytesRecvExpr := connectionMetricExpr("clustercost_connection_bytes_received_total", labels, opts.Namespace, windowStr, endSeconds, groupBy, "increase")
+	egressExpr := connectionMetricExpr("clustercost_connection_egress_cost_usd_total", labels, opts.Namespace, windowStr, endSeconds, groupBy, "increase")
+	countExpr := connectionMetricExpr("clustercost_connection_bytes_sent_total", labels, opts.Namespace, windowStr, endSeconds, groupBy, "count")
+
+	sentSamples, err := c.query(ctx, bytesSentExpr)
+	if err != nil {
+		return nil, err
+	}
+	recvSamples, err := c.query(ctx, bytesRecvExpr)
+	if err != nil {
+		return nil, err
+	}
+	egressSamples, err := c.query(ctx, egressExpr)
+	if err != nil {
+		return nil, err
+	}
+
+	startSeconds := opts.Start.UTC().Unix()
+	edges := make(map[string]*store.NetworkEdge)
+
+	applySample := func(sample sample, assign func(*store.NetworkEdge, float64)) {
+		edge := edgeFromLabels(sample.labels, groupLabels)
+		if edge == nil {
+			return
+		}
+		if opts.Namespace != "" && edge.SrcNamespace != opts.Namespace && edge.DstNamespace != opts.Namespace {
+			return
+		}
+		key := edgeKey(sample.labels, groupLabels)
+		current := edges[key]
+		if current == nil {
+			edge.FirstSeen = startSeconds
+			edge.LastSeen = endSeconds
+			edges[key] = edge
+			current = edge
+		}
+		assign(current, sample.value)
+	}
+
+	for _, sample := range sentSamples {
+		applySample(sample, func(edge *store.NetworkEdge, value float64) {
+			edge.BytesSent = int64(value)
+		})
+	}
+	for _, sample := range recvSamples {
+		applySample(sample, func(edge *store.NetworkEdge, value float64) {
+			edge.BytesReceived = int64(value)
+		})
+	}
+	for _, sample := range egressSamples {
+		applySample(sample, func(edge *store.NetworkEdge, value float64) {
+			edge.EgressCostUSD = value
+		})
+	}
+	countSamples, err := c.query(ctx, countExpr)
+	if err != nil {
+		return nil, err
+	}
+	for _, sample := range countSamples {
+		applySample(sample, func(edge *store.NetworkEdge, value float64) {
+			edge.ConnectionCount = int64(value)
+		})
+	}
+
+	if len(edges) == 0 {
+		return nil, ErrNoData
+	}
+
+	list := make([]store.NetworkEdge, 0, len(edges))
+	for _, edge := range edges {
+		list = append(list, *edge)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].EgressCostUSD != list[j].EgressCostUSD {
+			return list[i].EgressCostUSD > list[j].EgressCostUSD
+		}
+		totalI := list[i].BytesSent + list[i].BytesReceived
+		totalJ := list[j].BytesSent + list[j].BytesReceived
+		return totalI > totalJ
+	})
+
+	if opts.Limit > 0 && len(list) > opts.Limit {
+		list = list[:opts.Limit]
+	}
+	return list, nil
 }
 
 func (c *Client) AgentStatus(ctx context.Context) (store.AgentStatusPayload, error) {
@@ -580,6 +713,96 @@ func (c *Client) scalarMetric(ctx context.Context, metric string) (float64, time
 	}
 	latest := c.seriesTimestampSafe(ctx, metric)
 	return samples[0].value, latest, nil
+}
+
+func formatDuration(value time.Duration) string {
+	seconds := int64(value.Seconds())
+	if seconds <= 0 {
+		return "0s"
+	}
+	if seconds%86400 == 0 {
+		return fmt.Sprintf("%dd", seconds/86400)
+	}
+	if seconds%3600 == 0 {
+		return fmt.Sprintf("%dh", seconds/3600)
+	}
+	if seconds%60 == 0 {
+		return fmt.Sprintf("%dm", seconds/60)
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+func edgeKey(labels map[string]string, keys []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, labels[key])
+	}
+	return strings.Join(values, "|")
+}
+
+func edgeFromLabels(labels map[string]string, keys []string) *store.NetworkEdge {
+	if len(labels) == 0 {
+		return nil
+	}
+	protocol := int64(0)
+	if raw := labels["protocol"]; raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			protocol = parsed
+		}
+	}
+
+	return &store.NetworkEdge{
+		SrcNamespace: labels["src_namespace"],
+		SrcPodName:   labels["src_pod"],
+		SrcNodeName:  labels["src_node"],
+		SrcIP:        labels["src_ip"],
+		SrcAZ:        labels["src_availability_zone"],
+		DstNamespace: labels["dst_namespace"],
+		DstPodName:   labels["dst_pod"],
+		DstNodeName:  labels["dst_node"],
+		DstIP:        labels["dst_ip"],
+		DstAZ:        labels["dst_availability_zone"],
+		DstKind:      labels["dst_kind"],
+		ServiceMatch: labels["service_match"],
+		DstServices:  labels["dst_services"],
+		Protocol:     protocol,
+	}
+}
+
+func connectionMetricExpr(metric string, baseLabels map[string]string, namespace, window string, endSeconds int64, groupBy, op string) string {
+	rangeExpr := func(selector string) string {
+		switch op {
+		case "count":
+			return fmt.Sprintf("(count_over_time(%s[%s] @ %d) > 0)", selector, window, endSeconds)
+		default:
+			return fmt.Sprintf("increase(%s[%s] @ %d)", selector, window, endSeconds)
+		}
+	}
+
+	selector := metricSelector(metric, baseLabels)
+	if namespace == "" {
+		return fmt.Sprintf("sum by (%s) (%s)", groupBy, rangeExpr(selector))
+	}
+
+	srcLabels := copyLabels(baseLabels)
+	dstLabels := copyLabels(baseLabels)
+	srcLabels["src_namespace"] = namespace
+	dstLabels["dst_namespace"] = namespace
+
+	srcSelector := metricSelector(metric, srcLabels)
+	dstSelector := metricSelector(metric, dstLabels)
+	return fmt.Sprintf("sum by (%s) ((%s) or (%s))", groupBy, rangeExpr(srcSelector), rangeExpr(dstSelector))
+}
+
+func copyLabels(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func (c *Client) seriesTimestamp(ctx context.Context, metric string, labels map[string]string) ([]sample, error) {

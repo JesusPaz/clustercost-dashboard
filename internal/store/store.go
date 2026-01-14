@@ -156,6 +156,39 @@ type ResourcesPayload struct {
 	NamespaceWaste []NamespaceWasteEntry `json:"namespaceWaste"`
 }
 
+// NetworkEdge describes an aggregated network connection for topology graphs.
+type NetworkEdge struct {
+	SrcNamespace    string  `json:"srcNamespace"`
+	SrcPodName      string  `json:"srcPodName"`
+	SrcNodeName     string  `json:"srcNodeName"`
+	SrcIP           string  `json:"srcIp"`
+	SrcAZ           string  `json:"srcAvailabilityZone"`
+	DstNamespace    string  `json:"dstNamespace"`
+	DstPodName      string  `json:"dstPodName"`
+	DstNodeName     string  `json:"dstNodeName"`
+	DstIP           string  `json:"dstIp"`
+	DstAZ           string  `json:"dstAvailabilityZone"`
+	DstKind         string  `json:"dstKind"`
+	ServiceMatch    string  `json:"serviceMatch"`
+	DstServices     string  `json:"dstServices"`
+	Protocol        int64   `json:"protocol"`
+	BytesSent       int64   `json:"bytesSent"`
+	BytesReceived   int64   `json:"bytesReceived"`
+	EgressCostUSD   float64 `json:"egressCostUsd"`
+	ConnectionCount int64   `json:"connectionCount"`
+	FirstSeen       int64   `json:"firstSeen"`
+	LastSeen        int64   `json:"lastSeen"`
+}
+
+// NetworkTopologyOptions controls topology queries.
+type NetworkTopologyOptions struct {
+	ClusterID string
+	Namespace string
+	Start     time.Time
+	End       time.Time
+	Limit     int
+}
+
 // AgentDatasetHealth summarizes data availability per dataset.
 type AgentDatasetHealth struct {
 	Namespaces string `json:"namespaces"`

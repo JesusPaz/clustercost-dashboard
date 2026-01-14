@@ -44,6 +44,9 @@ func (f *fakeMetricsProvider) Agents(context.Context) ([]store.AgentInfo, error)
 func (f *fakeMetricsProvider) ClusterMetadata(context.Context) (store.ClusterMetadata, error) {
 	return f.meta, nil
 }
+func (f *fakeMetricsProvider) NetworkTopology(context.Context, store.NetworkTopologyOptions) ([]store.NetworkEdge, error) {
+	return nil, vm.ErrNoData
+}
 
 func newTestHandler(meta store.ClusterMetadata, status store.AgentStatusPayload) *Handler {
 	return &Handler{vm: &fakeMetricsProvider{meta: meta, status: status}}

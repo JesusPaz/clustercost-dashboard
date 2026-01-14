@@ -27,6 +27,7 @@ type MetricsProvider interface {
 	AgentStatus(ctx context.Context) (store.AgentStatusPayload, error)
 	Agents(ctx context.Context) ([]store.AgentInfo, error)
 	ClusterMetadata(ctx context.Context) (store.ClusterMetadata, error)
+	NetworkTopology(ctx context.Context, opts store.NetworkTopologyOptions) ([]store.NetworkEdge, error)
 }
 
 // Handler wires HTTP requests to the VictoriaMetrics client.
@@ -79,6 +80,10 @@ func NewRouter(vmClient MetricsProvider, db *db.Store, st *store.Store, finopsEn
 
 			protected.Route("/finops", func(finops chi.Router) {
 				finops.Get("/efficiency", h.EfficiencyReport)
+			})
+
+			protected.Route("/network", func(network chi.Router) {
+				network.Get("/topology", h.NetworkTopology)
 			})
 		})
 	})

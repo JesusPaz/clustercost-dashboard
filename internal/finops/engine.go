@@ -11,6 +11,7 @@ import (
 
 // EfficiencyReport represents the financial analysis of a workload.
 type EfficiencyReport struct {
+	Namespace          string  `json:"namespace"`
 	Service            string  `json:"service"`
 	RequestedCostMo    float64 `json:"requested_cost_mo"`
 	ActualUsageCostMo  float64 `json:"actual_usage_cost_mo"`
@@ -102,6 +103,7 @@ func (e *Engine) CalculatePodEfficiency(ctx context.Context, pod *agentv1.PodMet
 	}
 
 	return &EfficiencyReport{
+		Namespace:          pod.Namespace,
 		Service:            pod.PodName, // Or workload name if available
 		RequestedCostMo:    totalReqMonthly,
 		ActualUsageCostMo:  totalUsageMonthly,

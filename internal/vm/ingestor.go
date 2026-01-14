@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -356,6 +357,31 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 		writeSample(buf, "clustercost_namespace_cpu_usage_seconds_total", nsLabels, formatFloat(agg.cpuUsageSeconds), tsMillis)
 		writeSample(buf, "clustercost_namespace_memory_rss_bytes_total", nsLabels, formatInt(agg.memoryRssBytes), tsMillis)
 	}
+
+	// 4. Emit Connection-Level Network Metrics
+	var totalTx uint64
+	var totalRx uint64
+	var totalEgressCost float64
+	for _, conn := range req.Connections {
+		if conn == nil {
+			continue
+		}
+
+		labels := connectionLabels(base, conn)
+		writeSample(buf, "clustercost_connection_bytes_sent_total", labels, formatUint(conn.BytesSent), tsMillis)
+		writeSample(buf, "clustercost_connection_bytes_received_total", labels, formatUint(conn.BytesReceived), tsMillis)
+		writeSample(buf, "clustercost_connection_egress_cost_usd_total", labels, formatFloat(conn.EgressCostUsd), tsMillis)
+
+		totalTx += conn.BytesSent
+		totalRx += conn.BytesReceived
+		totalEgressCost += conn.EgressCostUsd
+	}
+
+	if totalTx > 0 || totalRx > 0 || totalEgressCost > 0 {
+		writeSample(buf, "clustercost_cluster_network_tx_bytes_total", base, formatUint(totalTx), tsMillis)
+		writeSample(buf, "clustercost_cluster_network_rx_bytes_total", base, formatUint(totalRx), tsMillis)
+		writeSample(buf, "clustercost_cluster_network_egress_cost_total", base, formatFloat(totalEgressCost), tsMillis)
+	}
 }
 
 func buildIngestURL(baseURL, ingestPath string) (string, error) {
@@ -457,6 +483,10 @@ func formatInt(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
 
+func formatUint(value uint64) string {
+	return strconv.FormatUint(value, 10)
+}
+
 func formatBool(value bool) string {
 	if value {
 		return "1"
@@ -465,9 +495,71 @@ func formatBool(value bool) string {
 }
 
 func reportTimestampMillis(req *agentv1.ReportRequest) int64 {
-	// ReportRequest v2 does not have a timestamp field.
-	// We use ingestion time.
+	if req != nil && req.TimestampSeconds > 0 {
+		return req.TimestampSeconds * 1000
+	}
 	return time.Now().UnixMilli()
+}
+
+func connectionLabels(base []label, conn *agentv1.NetworkConnection) []label {
+	if conn == nil {
+		return base
+	}
+
+	labels := appendLabels(base,
+		label{"protocol", strconv.FormatUint(uint64(conn.Protocol), 10)},
+		label{"egress_class", conn.EgressClass},
+		label{"dst_kind", conn.DstKind},
+		label{"service_match", conn.ServiceMatch},
+		label{"is_egress", strconv.FormatBool(conn.IsEgress)},
+	)
+
+	if conn.Src != nil {
+		labels = appendLabels(labels, endpointLabels("src", conn.Src)...)
+	}
+	if conn.Dst != nil {
+		labels = appendLabels(labels, endpointLabels("dst", conn.Dst)...)
+		services := joinServiceRefs(conn.Dst.Services)
+		if services != "" {
+			labels = appendLabels(labels, label{"dst_services", services})
+		}
+	}
+	return labels
+}
+
+func endpointLabels(prefix string, ep *agentv1.NetworkEndpoint) []label {
+	if ep == nil {
+		return nil
+	}
+	return []label{
+		{prefix + "_ip", ep.Ip},
+		{prefix + "_namespace", ep.Namespace},
+		{prefix + "_pod", ep.PodName},
+		{prefix + "_node", ep.NodeName},
+		{prefix + "_availability_zone", ep.AvailabilityZone},
+	}
+}
+
+func joinServiceRefs(services []*agentv1.ServiceRef) string {
+	if len(services) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(services))
+	for _, svc := range services {
+		if svc == nil {
+			continue
+		}
+		if svc.Namespace == "" && svc.Name == "" {
+			continue
+		}
+		if svc.Namespace == "" {
+			parts = append(parts, svc.Name)
+			continue
+		}
+		parts = append(parts, svc.Namespace+"/"+svc.Name)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }
 
 func max(a, b int) int {

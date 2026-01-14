@@ -16,6 +16,9 @@ import { CostByEnvironmentChart } from "../../charts/CostByEnvironmentChart";
 import { NamespaceDetailSheet } from "@/components/namespaces/NamespaceDetailSheet";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Progress } from "@/components/ui/progress";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 
 interface DerivedNamespace {
   name: string;
@@ -28,6 +31,9 @@ interface DerivedNamespace {
   cpuUsed: number;
   memoryRequested: number;
   memoryUsed: number;
+  efficiencyRatio: number;
+  wasteMonthlyCost: number;
+  wastePercent: number;
   labels: Record<string, string>;
 }
 
@@ -45,6 +51,7 @@ const envMap: Record<string, Environment> = {
 const OverviewPage = () => {
   const { data, loading, error, refresh } = useApiData(fetchNamespaces);
   const [selected, setSelected] = useState<DerivedNamespace | null>(null);
+  const [selectedZombie, setSelectedZombie] = useState<DerivedNamespace | null>(null);
 
   const records = data?.records ?? [];
 
@@ -58,6 +65,11 @@ const OverviewPage = () => {
       const memoryUsed = bytesToGiB(record.memoryUsageBytes ?? 0);
       const cpuUsagePercent = cpuRequested > 0 ? Math.min(100, (cpuUsed / cpuRequested) * 100) : 0;
       const memoryUsagePercent = memoryRequested > 0 ? Math.min(100, (memoryUsed / memoryRequested) * 100) : 0;
+      const cpuEfficiency = cpuRequested > 0 ? cpuUsed / cpuRequested : 1;
+      const memoryEfficiency = memoryRequested > 0 ? memoryUsed / memoryRequested : 1;
+      const efficiencyRatio = Math.max(0, Math.min(1, Math.min(cpuEfficiency, memoryEfficiency)));
+      const wastePercent = 1 - Math.max(0, Math.min(1, (cpuEfficiency + memoryEfficiency) / 2));
+      const wasteMonthlyCost = toMonthlyCost(hourlyCost) * wastePercent;
       return {
         name: record.namespace,
         hourlyCost,
@@ -69,6 +81,9 @@ const OverviewPage = () => {
         cpuUsed,
         memoryRequested,
         memoryUsed,
+        efficiencyRatio,
+        wasteMonthlyCost,
+        wastePercent,
         labels: record.labels ?? {}
       };
     });
@@ -76,6 +91,9 @@ const OverviewPage = () => {
 
   const sortedByCost = useMemo(() => [...derived].sort((a, b) => b.monthlyCost - a.monthlyCost), [derived]);
   const totalMonthly = useMemo(() => derived.reduce((sum, ns) => sum + ns.monthlyCost, 0), [derived]);
+  const totalWasteMonthly = useMemo(() => derived.reduce((sum, ns) => sum + ns.wasteMonthlyCost, 0), [derived]);
+  const totalWastePercent = totalMonthly > 0 ? (totalWasteMonthly / totalMonthly) * 100 : 0;
+  const hourlyLeak = totalWasteMonthly / (30 * 24);
   const topNamespace = sortedByCost[0];
   const topNamespaceShare = topNamespace && totalMonthly > 0 ? (topNamespace.monthlyCost / totalMonthly) * 100 : 0;
   const buckets = useMemo(() => {
@@ -111,6 +129,51 @@ const OverviewPage = () => {
   const quickWinsWaste = useMemo(() => quickWins.reduce((sum, ns) => sum + ns.monthlyCost, 0), [quickWins]);
 
   const lastUpdated = data?.lastUpdated ? relativeTimeFromIso(data.lastUpdated) : "moments ago";
+
+  const zombieCandidates = useMemo(() => {
+    return [...derived]
+      .filter((ns) => ns.efficiencyRatio > 0 && ns.efficiencyRatio < 0.1)
+      .sort((a, b) => b.wasteMonthlyCost - a.wasteMonthlyCost)
+      .slice(0, 5);
+  }, [derived]);
+
+  const heatmapCells = useMemo(() => {
+    return derived
+      .map((ns) => {
+        const tone =
+          ns.wastePercent >= 0.7
+            ? "bg-red-600/90 text-white border-red-500/60"
+            : ns.wastePercent >= 0.4
+              ? "bg-amber-400/80 text-amber-950 border-amber-500/60"
+              : "bg-emerald-500/20 text-emerald-900 border-emerald-500/30";
+        return { ...ns, tone };
+      })
+      .sort((a, b) => b.wastePercent - a.wastePercent);
+  }, [derived]);
+
+  const selectedZombieYaml = useMemo(() => {
+    if (!selectedZombie) return "";
+    const cpuTarget = Math.max(0.1, selectedZombie.cpuUsed * 1.2);
+    const memoryTarget = Math.max(0.1, selectedZombie.memoryUsed * 1.2);
+    return `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${selectedZombie.name}-resized
+  namespace: ${selectedZombie.name}
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          resources:
+            requests:
+              cpu: "${cpuTarget.toFixed(2)}"
+              memory: "${memoryTarget.toFixed(1)}Gi"
+            limits:
+              cpu: "${(cpuTarget * 1.5).toFixed(2)}"
+              memory: "${(memoryTarget * 1.5).toFixed(1)}Gi"
+`;
+  }, [selectedZombie]);
 
   const detailSnapshot = selected
     ? {
@@ -200,6 +263,137 @@ const OverviewPage = () => {
         </div>
         <div className="text-sm text-muted-foreground">Last updated {lastUpdated}</div>
       </header>
+
+      <section className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Card className="relative overflow-hidden border-destructive/50 bg-gradient-to-br from-red-950/35 via-red-950/10 to-background">
+          <CardHeader className="space-y-2 pb-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <CardTitle className="text-lg font-semibold text-destructive">Monthly Burn</CardTitle>
+              <Badge variant="destructive" className="uppercase tracking-wide">
+                Recuperable Revenue
+              </Badge>
+            </div>
+            <CardDescription className="text-sm text-destructive/90">
+              Money leaking from the budget based on request vs reality.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <p className="text-xs uppercase tracking-wide text-destructive/80">Potential Monthly Savings</p>
+              <p className="text-4xl font-semibold text-destructive">{formatCurrency(totalWasteMonthly)}</p>
+              <p className="text-sm text-muted-foreground">
+                You are wasting {formatPercentage(totalWastePercent, { fractionDigits: 0 })} of your allocated budget.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+              <span className="rounded-full border border-destructive/40 bg-destructive/10 px-3 py-1 text-destructive">
+                Leaking {formatCurrency(hourlyLeak, { maximumFractionDigits: 2 })}/hr right now
+              </span>
+              <span>Last updated {lastUpdated}</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-muted-foreground/20">
+          <CardHeader className="space-y-2 pb-2">
+            <CardTitle className="text-sm uppercase tracking-wide text-muted-foreground">Savings report</CardTitle>
+            <CardDescription className="text-xs text-muted-foreground">
+              Export the top offenders for finance.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 p-3 text-sm">
+              <p className="font-medium text-foreground">Executive PDF snapshot</p>
+              <p className="text-xs text-muted-foreground">Top 5 zombies + total savings, 1 page.</p>
+            </div>
+            <Button variant="outline" className="w-full">
+              Generate Executive PDF
+            </Button>
+          </CardContent>
+        </Card>
+      </section>
+
+      <section className="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Card>
+          <CardHeader>
+            <CardTitle>Top 5 money zombies</CardTitle>
+            <CardDescription>Pods consuming &lt; 10% of what they reserved.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {zombieCandidates.length === 0 ? (
+              <div className="rounded-md border border-dashed border-muted-foreground/30 p-6 text-center text-sm text-muted-foreground">
+                No zombies detected. Utilization is tight right now.
+              </div>
+            ) : (
+              <div className="overflow-hidden rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Namespace</TableHead>
+                      <TableHead className="text-right">Efficiency</TableHead>
+                      <TableHead className="text-right">Cost of silence</TableHead>
+                      <TableHead className="text-right">Action</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {zombieCandidates.map((ns) => {
+                      const multiplier = ns.efficiencyRatio > 0 ? Math.min(99, Math.round(1 / ns.efficiencyRatio)) : 99;
+                      return (
+                        <TableRow key={ns.name}>
+                          <TableCell className="font-medium">
+                            <div className="flex items-center gap-2">
+                              <span>{ns.name}</span>
+                              <Badge variant="destructive">Zombie</Badge>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-right text-sm text-muted-foreground">
+                            {formatPercentage(ns.efficiencyRatio * 100, { fractionDigits: 0 })} ({multiplier}x)
+                          </TableCell>
+                          <TableCell className="text-right font-semibold text-destructive">
+                            {formatCurrency(ns.wasteMonthlyCost, { maximumFractionDigits: 0 })}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              size="sm"
+                              variant="destructive"
+                              onClick={() => setSelectedZombie(ns)}
+                            >
+                              Kill/Resize
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Efficiency heatmap</CardTitle>
+            <CardDescription>Bright red = massive waste.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid gap-2 sm:grid-cols-2">
+              {heatmapCells.map((ns) => (
+                <div
+                  key={ns.name}
+                  className={`rounded-md border px-3 py-2 text-xs font-medium ${ns.tone}`}
+                  title={`${ns.name} wasting ${formatPercentage(ns.wastePercent * 100, { fractionDigits: 0 })}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate">{ns.name}</span>
+                    <span>{formatPercentage(ns.wastePercent * 100, { fractionDigits: 0 })}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </section>
 
       <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card>
@@ -404,6 +598,38 @@ const OverviewPage = () => {
       </section>
 
       <NamespaceDetailSheet open={!!selected} onOpenChange={(open) => !open && setSelected(null)} data={detailSnapshot} />
+      <Sheet open={!!selectedZombie} onOpenChange={(open) => !open && setSelectedZombie(null)}>
+        <SheetContent className="w-full sm:max-w-lg">
+          <SheetHeader>
+            <SheetTitle>Optimization action</SheetTitle>
+            <SheetDescription>Generated YAML to resize the zombie workload.</SheetDescription>
+          </SheetHeader>
+          {selectedZombie ? (
+            <div className="mt-6 space-y-4 text-sm">
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 p-4">
+                <p className="font-medium text-destructive">
+                  {selectedZombie.name} is wasting {formatCurrency(selectedZombie.wasteMonthlyCost)} / month
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Efficiency {formatPercentage(selectedZombie.efficiencyRatio * 100, { fractionDigits: 0 })} · Requests far
+                  above reality
+                </p>
+              </div>
+              <div>
+                <p className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">Proposed YAML</p>
+                <pre className="overflow-auto rounded-md border bg-muted/20 p-3 text-xs">
+                  {selectedZombieYaml}
+                </pre>
+              </div>
+              <div className="flex justify-end">
+                <Button variant="destructive" onClick={() => setSelectedZombie(null)}>
+                  Mark as actioned
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </SheetContent>
+      </Sheet>
     </div>
   );
 };

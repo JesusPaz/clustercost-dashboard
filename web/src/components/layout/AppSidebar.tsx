@@ -1,5 +1,5 @@
 import { NavLink, useLocation } from "react-router-dom";
-import { Cloud, Gauge, LayoutGrid, Network, PieChart, Server } from "lucide-react";
+import { Cloud, Gauge, GitBranch, LayoutGrid, Network, PieChart, Server } from "lucide-react";
 
 import {
   Sidebar,
@@ -20,6 +20,7 @@ const navItems = [
   { to: "/namespaces", label: "Namespaces", icon: LayoutGrid },
   { to: "/nodes", label: "Nodes", icon: Server },
   { to: "/resources", label: "Resources", icon: PieChart },
+  { to: "/network", label: "Network Map", icon: GitBranch },
   { to: "/agents", label: "Agents", icon: Network },
   { to: "/connect-cloud", label: "Connect Cloud", icon: Cloud }
 ];

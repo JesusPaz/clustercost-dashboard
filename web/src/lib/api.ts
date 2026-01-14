@@ -203,11 +203,49 @@ export interface HealthResponse {
   timestamp: string;
 }
 
+export type NetworkEdge = {
+  srcNamespace: string;
+  srcPodName: string;
+  srcNodeName: string;
+  srcIp: string;
+  srcAvailabilityZone: string;
+  dstNamespace: string;
+  dstPodName: string;
+  dstNodeName: string;
+  dstIp: string;
+  dstAvailabilityZone: string;
+  dstKind: string;
+  serviceMatch: string;
+  dstServices: string;
+  protocol: number;
+  bytesSent: number;
+  bytesReceived: number;
+  egressCostUsd: number;
+  connectionCount: number;
+  firstSeen: number;
+  lastSeen: number;
+};
+
+export type NetworkTopologyResponse = {
+  clusterId: string;
+  namespace?: string;
+  start: string;
+  end: string;
+  edges: NetworkEdge[];
+  totalEdges: number;
+  requestedLimit: number;
+  timestamp: string;
+};
 
 let authToken: string | null = null;
+let unauthorizedHandler: (() => void) | null = null;
 
 export const setAuthToken = (token: string | null) => {
   authToken = token;
+};
+
+export const setUnauthorizedHandler = (handler: (() => void) | null) => {
+  unauthorizedHandler = handler;
 };
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -222,8 +260,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   });
 
   if (response.status === 401) {
-    // Optional: Global logout trigger could go here if we had access to history/context
-    // For now, just throw
+    setAuthToken(null);
+    unauthorizedHandler?.();
     throw new Error("Unauthorized");
   }
 
@@ -310,3 +348,25 @@ export const fetchResources = async (): Promise<ResourcesSummary> => {
 
 export const fetchHealth = () => request<HealthResponse>("/health");
 export const fetchAgentStatus = () => request<AgentStatusResponse>("/agent");
+
+export type NetworkTopologyParams = {
+  clusterId?: string;
+  namespace?: string;
+  lookback?: string;
+  start?: string | number;
+  end?: string | number;
+  limit?: number;
+};
+
+export const fetchNetworkTopology = async (params: NetworkTopologyParams): Promise<NetworkTopologyResponse> => {
+  const search = new URLSearchParams();
+  if (params.clusterId) search.set("clusterId", params.clusterId);
+  if (params.namespace) search.set("namespace", params.namespace);
+  if (params.lookback) search.set("lookback", params.lookback);
+  if (params.start !== undefined) search.set("start", String(params.start));
+  if (params.end !== undefined) search.set("end", String(params.end));
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+
+  const query = search.toString();
+  return request<NetworkTopologyResponse>(`/network/topology${query ? `?${query}` : ""}`);
+};
