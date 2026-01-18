@@ -1,4 +1,4 @@
-.PHONY: backend frontend build docker test clean dev-backend dev-frontend dev-bundle generate-pricing
+.PHONY: backend frontend build docker test lint sec clean dev-backend dev-frontend dev-bundle generate-pricing
 
 generate-pricing:
 	go run scripts/generate_pricing.go
@@ -39,6 +39,12 @@ docker:
 
 test:
 	GOMODCACHE=$(PWD)/.gocache GOCACHE=$(PWD)/.gocache/go go test ./...
+
+lint:
+	golangci-lint run
+
+sec:
+	gosec -exclude-dir=internal/proto -exclude-dir=.gocache ./...
 
 clean:
 	rm -rf .gocache web/node_modules web/dist $(BIN_DIR)

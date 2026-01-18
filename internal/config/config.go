@@ -2,8 +2,8 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +43,7 @@ type Config struct {
 	VictoriaMetricsLookback      time.Duration `yaml:"victoriaMetricsLookback"`
 	StoragePath                  string        `yaml:"storagePath"`
 	JWTSecret                    string        `yaml:"jwtSecret"`
+	LogLevel                     string        `yaml:"logLevel"`
 }
 
 // Default returns the default configuration used when no other information is provided.
@@ -212,11 +213,18 @@ func Load() (Config, error) {
 		cfg.JWTSecret = secret
 	}
 
+	if logLevel := os.Getenv("LOG_LEVEL"); logLevel != "" {
+		cfg.LogLevel = strings.ToLower(logLevel)
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+
 	return cfg, nil
 }
 
 func fromFile(path string) (Config, error) {
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(filepath.Clean(path)) // #nosec G304 -- loading config from user-supplied path is intended
 	if err != nil {
 		return Config{}, fmt.Errorf("read config file: %w", err)
 	}

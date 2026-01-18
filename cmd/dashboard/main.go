@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"flag"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,6 +28,14 @@ func main() {
 		logger.Fatalf("load config: %v", err)
 	}
 
+	logLevel := flag.String("log-level", "", "Set the logging level (info, debug)")
+	flag.Parse()
+
+	if *logLevel != "" {
+		cfg.LogLevel = strings.ToLower(*logLevel)
+	}
+	logger.Printf("Configured Log Level: %s", cfg.LogLevel)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -38,7 +48,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("sqlite setup error: %v", err)
 	}
-	defer sqlite.Close()
+	defer func() { _ = sqlite.Close() }()
 
 	// Initialize In-Memory Store
 	st := store.New(cfg.Agents, cfg.RecommendedAgentVersion)
@@ -49,8 +59,9 @@ func main() {
 	auth.SetSecret(cfg.JWTSecret)
 
 	srv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: api.NewRouter(vmClient, sqlite, st, finopsEngine),
+		Addr:              cfg.ListenAddr,
+		Handler:           api.NewRouter(vmClient, sqlite, st, finopsEngine),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	vmIngestor, err := vm.NewIngestor(cfg, logger)

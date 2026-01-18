@@ -8,16 +8,25 @@ import (
 	"sync"
 	"time"
 
+	"math"
+
 	"github.com/clustercost/clustercost-dashboard/internal/config"
 	"github.com/clustercost/clustercost-dashboard/internal/pricing"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 )
 
+func safeInt64(u uint64) int64 {
+	if u > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(u)
+}
+
 // ErrNoData indicates that the store has not ingested any data yet.
 var ErrNoData = errors.New("no data available")
 
 const hoursPerMonth = 24 * 30
-const datasetFreshThreshold = 2 * time.Minute
+
 const agentOfflineThreshold = 5 * time.Minute
 
 var environments = []string{"production", "nonprod", "system", "unknown"}
@@ -35,8 +44,13 @@ type Store struct {
 // AgentSnapshot contains the most recent data fetched for an agent.
 type AgentSnapshot struct {
 	// Raw Report from the agent
-	Report         *agentv1.ReportRequest
-	PreviousReport *agentv1.ReportRequest
+	// Raw Report from the agent
+	Report         *agentv1.MetricsReportRequest
+	PreviousReport *agentv1.MetricsReportRequest
+
+	// Network Report
+	Network         *agentv1.NetworkReportRequest
+	PreviousNetwork *agentv1.NetworkReportRequest
 
 	LastScrape    time.Time
 	LastScrapeDur time.Duration // Duration since previous scrape used for rate calc
@@ -108,6 +122,12 @@ type NodeSummary struct {
 	InstanceType           string            `json:"instanceType,omitempty"`
 	Labels                 map[string]string `json:"labels"`
 	Taints                 []string          `json:"taints"`
+	// Network (Host Level)
+	NetTxBytes          int64 `json:"netTxBytes"`
+	NetRxBytes          int64 `json:"netRxBytes"`
+	EgressPublicBytes   int64 `json:"egressPublicBytes"`
+	EgressCrossAZBytes  int64 `json:"egressCrossAZBytes"`
+	EgressInternalBytes int64 `json:"egressInternalBytes"`
 }
 
 // NodeListResponse wraps paginated node results.
@@ -286,17 +306,22 @@ func (s *Store) PricingCatalog() *PricingCatalog {
 	return s.pricing
 }
 
-// Update stores the latest report for a given agent.
-func (s *Store) Update(agentID string, req *agentv1.ReportRequest) {
+// UpdateMetrics stores the latest report for a given agent.
+func (s *Store) UpdateMetrics(agentID string, req *agentv1.MetricsReportRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Find existing to keep as previous
-	var prev *agentv1.ReportRequest
+	var prev *agentv1.MetricsReportRequest
 	var lastScrape time.Time
+	var existingNetwork *agentv1.NetworkReportRequest
+	var existingPrevNetwork *agentv1.NetworkReportRequest
+
 	if existing, ok := s.snapshots[agentID]; ok {
 		prev = existing.Report
 		lastScrape = existing.LastScrape
+		existingNetwork = existing.Network
+		existingPrevNetwork = existing.PreviousNetwork
 	}
 
 	now := time.Now().UTC()
@@ -306,12 +331,34 @@ func (s *Store) Update(agentID string, req *agentv1.ReportRequest) {
 	}
 
 	s.snapshots[agentID] = &AgentSnapshot{
-		Report:         req,
-		PreviousReport: prev,
-		LastScrape:     now,
-		LastScrapeDur:  dur,
-		LastError:      "",
+		Report:          req,
+		PreviousReport:  prev,
+		LastScrape:      now,
+		LastScrapeDur:   dur,
+		LastError:       "",
+		Network:         existingNetwork,
+		PreviousNetwork: existingPrevNetwork,
 	}
+}
+
+// UpdateNetwork stores the latest network report for a given agent.
+func (s *Store) UpdateNetwork(agentID string, req *agentv1.NetworkReportRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var prev *agentv1.NetworkReportRequest
+	if existing, ok := s.snapshots[agentID]; ok {
+		prev = existing.Network
+	} else {
+		// Create placeholder snapshot if metrics haven't arrived yet
+		s.snapshots[agentID] = &AgentSnapshot{
+			LastScrape: time.Now().UTC(),
+		}
+	}
+
+	snap := s.snapshots[agentID]
+	snap.PreviousNetwork = prev
+	snap.Network = req
 }
 
 // GetAllPods returns all pods from all agents with their context.
@@ -849,9 +896,9 @@ func (s *Store) aggregateNamespacesLocked() (map[string]*NamespaceSummary, error
 			}
 
 			// Aggregate Costs
-			memUsageBytes := int64(0)
+			memUsageBytes := safeInt64(0)
 			if pod.Memory != nil {
-				memUsageBytes = int64(pod.Memory.RssBytes)
+				memUsageBytes = safeInt64(pod.Memory.RssBytes)
 			}
 			memGB := float64(memUsageBytes) / (1024 * 1024 * 1024)
 
@@ -871,14 +918,14 @@ func (s *Store) aggregateNamespacesLocked() (map[string]*NamespaceSummary, error
 			entry.HourlyCost += hourCost
 			entry.MemoryUsageBytes += memUsageBytes
 			if pod.Cpu != nil {
-				entry.CPUUsageMilli += int64(pod.Cpu.UsageMillicores)
+				entry.CPUUsageMilli += safeInt64(pod.Cpu.UsageMillicores)
 			}
 			if pod.Cpu != nil {
-				entry.CPURequestMilli += int64(pod.Cpu.RequestMillicores)
-				entry.CPULimitMilli += int64(pod.Cpu.LimitMillicores)
+				entry.CPURequestMilli += safeInt64(pod.Cpu.RequestMillicores)
+				entry.CPULimitMilli += safeInt64(pod.Cpu.LimitMillicores)
 			}
 			if pod.Memory != nil {
-				entry.MemoryRequestBytes += int64(pod.Memory.RequestBytes)
+				entry.MemoryRequestBytes += safeInt64(pod.Memory.RequestBytes)
 			}
 			entry.PodCount++
 		}
@@ -925,38 +972,55 @@ func (s *Store) aggregateNodesLocked() (map[string]*NodeSummary, error) {
 		}
 		haveData = true
 
-		name := snap.Report.NodeName
-		if name == "" {
-			name = "unknown"
-		}
-
-		entry, ok := nodes[name]
-		if !ok {
-			entry = &NodeSummary{
-				NodeName: name,
-				Labels:   make(map[string]string),
-				Status:   "Ready", // assumption
+		// Iterate over all nodes reported by this agent
+		for _, n := range snap.Report.Nodes {
+			if n == nil || n.NodeName == "" {
+				continue
 			}
-			nodes[name] = entry
-		}
+			name := n.NodeName
 
-		// Calculate node totals from pods
-		for range snap.Report.Pods {
-			entry.PodCount++
-		}
+			entry, ok := nodes[name]
+			if !ok {
+				entry = &NodeSummary{
+					NodeName:               name,
+					Labels:                 make(map[string]string),
+					Status:                 "Ready",
+					InstanceType:           "default", // placeholder
+					CPUAllocatableMilli:    safeInt64(n.AllocatableCpuMillicores),
+					MemoryAllocatableBytes: safeInt64(n.AllocatableMemoryBytes),
+				}
+				nodes[name] = entry
+			}
 
-		// Cost estimation
-		// We use dynamic pricing from catalog.
-		region := snap.Report.AvailabilityZone
-		if region == "" {
-			region = "us-east-1"
-		}
-		// Default instance type if missing
-		instanceType := "default"
-		// If Report had InstanceType, we would use it.
+			// Capture metrics
+			if n.AllocatableCpuMillicores > 0 {
+				entry.CPUUsagePercent = (float64(n.CpuUsageMillicores) / float64(n.AllocatableCpuMillicores)) * 100
+			}
+			if n.AllocatableMemoryBytes > 0 {
+				entry.MemoryUsagePercent = (float64(n.MemoryUsageBytes) / float64(n.AllocatableMemoryBytes)) * 100
+			}
 
-		price := s.pricing.GetTotalNodePrice(context.Background(), region, instanceType)
-		entry.HourlyCost = price
+			// Network (Host)
+			if n.Network != nil {
+				entry.NetTxBytes = safeInt64(n.Network.BytesSent)
+				entry.NetRxBytes = safeInt64(n.Network.BytesReceived)
+				entry.EgressPublicBytes = safeInt64(n.Network.EgressPublicBytes)
+				entry.EgressCrossAZBytes = safeInt64(n.Network.EgressCrossAzBytes)
+				entry.EgressInternalBytes = safeInt64(n.Network.EgressInternalBytes)
+			}
+
+			// Cost calculation (simplified for now, using hardcoded price or placeholder)
+			// Ideally we lookup price by InstanceType/Zone from labels if available
+			// For now, assume $0.10/hr
+			entry.HourlyCost = 0.10
+
+			// Count pods logic:
+			// Assuming Agent runs as DaemonSet, all pods in this report belong to the agent's node.
+			// The agent's node is specified in snap.Report.NodeName.
+			if n.NodeName == snap.Report.NodeName {
+				entry.PodCount = len(snap.Report.Pods)
+			}
+		}
 	}
 
 	if !haveData {
@@ -1107,26 +1171,6 @@ func clampFloat(value, min, max float64) float64 {
 	return value
 }
 
-func copyLabels(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return map[string]string{}
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func copyStrings(in []string) []string {
-	if len(in) == 0 {
-		return []string{}
-	}
-	out := make([]string, len(in))
-	copy(out, in)
-	return out
-}
-
 func environmentMatches(filter, env string) bool {
 	if filter == "" || filter == "all" {
 		return true
@@ -1146,21 +1190,4 @@ func maxFloat(a, b float64) float64 {
 		return a
 	}
 	return b
-}
-
-func datasetStatus(hasData bool, timestamp, fallback time.Time) string {
-	if !hasData {
-		return "missing"
-	}
-	effective := timestamp
-	if effective.IsZero() {
-		effective = fallback
-	}
-	if effective.IsZero() {
-		return "partial"
-	}
-	if time.Since(effective) > datasetFreshThreshold {
-		return "partial"
-	}
-	return "ok"
 }

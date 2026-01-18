@@ -19,7 +19,7 @@ func newTestStore() *Store {
 
 func TestClusterMetadataReturnsLatestSnapshot(t *testing.T) {
 	s := newTestStore()
-	s.Update("test-agent", &agentv1.ReportRequest{
+	s.UpdateMetrics("test-agent", &agentv1.MetricsReportRequest{
 		AgentId:   "test-agent",
 		ClusterId: "cluster-1",
 		// ClusterName removed
@@ -51,7 +51,7 @@ func TestClusterMetadataReturnsLatestSnapshot(t *testing.T) {
 func TestAgentStatusConnectedWhenDataFresh(t *testing.T) {
 	s := newTestStore()
 
-	s.Update("test-agent", &agentv1.ReportRequest{
+	s.UpdateMetrics("test-agent", &agentv1.MetricsReportRequest{
 		AgentId:          "test-agent",
 		ClusterId:        "cluster-2",
 		NodeName:         "node-1",
@@ -94,7 +94,7 @@ func TestCPUUsageCalculation(t *testing.T) {
 	agentID := "test-agent"
 
 	// 1. Initial Report (Baseline)
-	s.Update(agentID, &agentv1.ReportRequest{
+	s.UpdateMetrics(agentID, &agentv1.MetricsReportRequest{
 		AgentId:          agentID,
 		ClusterId:        "cluster-1",
 		NodeName:         "node-1",
@@ -113,7 +113,7 @@ func TestCPUUsageCalculation(t *testing.T) {
 
 	// 2. Second Report (usage 500m)
 	// % = 0.5 / 2.0 = 25%
-	s.Update(agentID, &agentv1.ReportRequest{
+	s.UpdateMetrics(agentID, &agentv1.MetricsReportRequest{
 		AgentId:          agentID,
 		ClusterId:        "cluster-1",
 		NodeName:         "node-1",
@@ -127,7 +127,7 @@ func TestCPUUsageCalculation(t *testing.T) {
 				Namespace: "default",
 				Cpu: &agentv1.CpuMetrics{
 					UsageMillicores: 500,
-					LimitMillicores: 2000,       // 2 Cores
+					LimitMillicores: 2000, // 2 Cores
 				},
 			},
 		},

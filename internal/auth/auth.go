@@ -70,7 +70,9 @@ func Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), "user", claims.Username)
+		type contextKey string
+		const userKey contextKey = "user"
+		ctx := context.WithValue(r.Context(), userKey, claims.Username)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

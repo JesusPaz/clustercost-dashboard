@@ -17,7 +17,7 @@ type Server struct {
 }
 
 func NewServer(cfg config.Config, ingestor ReportIngestor, st *store.Store) *Server {
-	auth := NewAuthInterceptor(cfg.Agents, cfg.DefaultAgentToken)
+	auth := NewAuthInterceptor(cfg.Agents, cfg.DefaultAgentToken, cfg.LogLevel)
 
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(auth.Unary()),
@@ -25,7 +25,7 @@ func NewServer(cfg config.Config, ingestor ReportIngestor, st *store.Store) *Ser
 
 	gsrv := grpc.NewServer(opts...)
 
-	collector := NewCollector(ingestor, st)
+	collector := NewCollector(ingestor, st, cfg.LogLevel)
 	agentv1.RegisterCollectorServer(gsrv, collector)
 
 	// Register reflection service on gRPC server (useful for grpcurl).

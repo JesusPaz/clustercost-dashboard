@@ -161,7 +161,7 @@ func (c *Client) query(ctx context.Context, expr string) ([]sample, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query victoria metrics: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("victoria metrics responded with status %d", resp.StatusCode)

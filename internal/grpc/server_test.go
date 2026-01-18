@@ -15,8 +15,8 @@ import (
 
 // ... (setup code remains similar)
 
-func TestReport_Unary(t *testing.T) {
-	// Rename to TestReport_Unary
+func TestReportMetrics_Unary(t *testing.T) {
+	// Rename to TestReportMetrics_Unary
 	lis := bufconn.Listen(1024 * 1024)
 	// Mock ingestor
 	ingestor := &fakeIngestor{}
@@ -53,8 +53,8 @@ func TestReport_Unary(t *testing.T) {
 		return metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer "+token))
 	}
 
-	t.Run("Valid Report", func(t *testing.T) {
-		req := &agentv1.ReportRequest{
+	t.Run("Valid Metrics Report", func(t *testing.T) {
+		req := &agentv1.MetricsReportRequest{
 			AgentId:          "agent-1",
 			ClusterId:        "cluster-1",
 			AvailabilityZone: "us-east-1",
@@ -67,9 +67,9 @@ func TestReport_Unary(t *testing.T) {
 			},
 		}
 
-		resp, err := client.Report(authCtx("secret"), req)
+		resp, err := client.ReportMetrics(authCtx("secret"), req)
 		if err != nil {
-			t.Fatalf("Report failed: %v", err)
+			t.Fatalf("ReportMetrics failed: %v", err)
 		}
 		if !resp.Accepted {
 			t.Errorf("Expected accepted=true, got false")
@@ -82,6 +82,10 @@ func TestReport_Unary(t *testing.T) {
 // fakeIngestor implementation...
 type fakeIngestor struct{}
 
-func (f *fakeIngestor) Enqueue(agentName string, req *agentv1.ReportRequest) bool {
+func (f *fakeIngestor) EnqueueMetrics(agentName string, req *agentv1.MetricsReportRequest) bool {
+	return true
+}
+
+func (f *fakeIngestor) EnqueueNetwork(agentName string, req *agentv1.NetworkReportRequest) bool {
 	return true
 }

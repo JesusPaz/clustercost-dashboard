@@ -441,7 +441,7 @@ func (c *Client) AgentStatus(ctx context.Context) (store.AgentStatusPayload, err
 		Resources:  datasetStatus(!resTS.IsZero(), resTS, lastSync),
 	}
 
-	status := "offline"
+	var status string
 	allOK := datasets.Namespaces == "ok" && datasets.Nodes == "ok" && datasets.Resources == "ok"
 	if time.Since(lastSync) > agentOfflineThreshold {
 		status = "offline"

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -19,9 +20,16 @@ import (
 	"time"
 
 	"github.com/clustercost/clustercost-dashboard/internal/config"
-	"github.com/clustercost/clustercost-dashboard/internal/store"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
+	"github.com/clustercost/clustercost-dashboard/internal/store"
 )
+
+func safeInt64(u uint64) int64 {
+	if u > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(u)
+}
 
 const (
 	defaultIngestPath     = "/api/v1/import/prometheus"
@@ -31,6 +39,8 @@ const (
 	defaultQueueSize      = 10000
 	defaultWorkerOverride = 0
 )
+
+var labelReplacer = strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`)
 
 // Ingestor batches gRPC reports into VictoriaMetrics.
 type Ingestor struct {
@@ -47,11 +57,14 @@ type Ingestor struct {
 	agentMeta     map[string]agentMetadata
 	stopped       atomic.Bool
 	wg            sync.WaitGroup
+	logLevel      string
+	gzipPool      sync.Pool
 }
 
 type reportEnvelope struct {
-	agentName string
-	req       *agentv1.ReportRequest
+	agentName  string
+	metricsReq *agentv1.MetricsReportRequest
+	networkReq *agentv1.NetworkReportRequest
 }
 
 type agentMetadata struct {
@@ -117,6 +130,12 @@ func NewIngestor(cfg config.Config, logger *log.Logger) (*Ingestor, error) {
 		client:        &http.Client{Timeout: timeout, Transport: transport},
 		logger:        logger,
 		agentMeta:     buildAgentMeta(cfg),
+		logLevel:      cfg.LogLevel,
+		gzipPool: sync.Pool{
+			New: func() interface{} {
+				return gzip.NewWriter(io.Discard)
+			},
+		},
 	}
 
 	for i := 0; i < workers; i++ {
@@ -127,18 +146,35 @@ func NewIngestor(cfg config.Config, logger *log.Logger) (*Ingestor, error) {
 	return ing, nil
 }
 
-// Enqueue queues a report for ingestion. It drops when the queue is full or stopped.
-func (i *Ingestor) Enqueue(agentName string, req *agentv1.ReportRequest) bool {
+// EnqueueMetrics queues a metrics report for ingestion.
+func (i *Ingestor) EnqueueMetrics(agentName string, req *agentv1.MetricsReportRequest) bool {
 	if i == nil || req == nil || i.stopped.Load() {
 		return false
 	}
 
 	select {
-	case i.queue <- reportEnvelope{agentName: agentName, req: req}:
+	case i.queue <- reportEnvelope{agentName: agentName, metricsReq: req}:
 		return true
 	default:
 		if i.logger != nil {
-			i.logger.Printf("victoria metrics queue full; dropping report for agent %s", agentName)
+			i.logger.Printf("victoria metrics queue full; dropping metrics report for agent %s", agentName)
+		}
+		return false
+	}
+}
+
+// EnqueueNetwork queues a network report for ingestion.
+func (i *Ingestor) EnqueueNetwork(agentName string, req *agentv1.NetworkReportRequest) bool {
+	if i == nil || req == nil || i.stopped.Load() {
+		return false
+	}
+
+	select {
+	case i.queue <- reportEnvelope{agentName: agentName, networkReq: req}:
+		return true
+	default:
+		if i.logger != nil {
+			i.logger.Printf("victoria metrics queue full; dropping network report for agent %s", agentName)
 		}
 		return false
 	}
@@ -162,6 +198,9 @@ func (i *Ingestor) runWorker(id int) {
 	defer ticker.Stop()
 
 	var buf bytes.Buffer
+	var labelBuf bytes.Buffer   // Reusable buffer for label caching
+	scratch := make([]byte, 64) // Reusable scratch for number formatting
+
 	flush := func() {
 		if buf.Len() == 0 {
 			return
@@ -179,7 +218,7 @@ func (i *Ingestor) runWorker(id int) {
 				flush()
 				return
 			}
-			i.appendReport(&buf, env)
+			i.appendReport(&buf, &labelBuf, scratch, env)
 			if buf.Len() >= i.maxBatchBytes {
 				flush()
 			}
@@ -191,7 +230,6 @@ func (i *Ingestor) runWorker(id int) {
 
 func (i *Ingestor) post(payload []byte) error {
 	var body io.Reader = bytes.NewReader(payload)
-	var gz *gzip.Writer
 	req, err := http.NewRequest(http.MethodPost, i.ingestURL, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -199,13 +237,17 @@ func (i *Ingestor) post(payload []byte) error {
 
 	if i.enableGzip {
 		var buf bytes.Buffer
-		gz = gzip.NewWriter(&buf)
+		gz := i.gzipPool.Get().(*gzip.Writer)
+		gz.Reset(&buf)
+
 		if _, err := gz.Write(payload); err != nil {
 			return fmt.Errorf("compress payload: %w", err)
 		}
 		if err := gz.Close(); err != nil {
 			return fmt.Errorf("finalize payload: %w", err)
 		}
+
+		i.gzipPool.Put(gz) // Return to pool
 		body = &buf
 		req.Header.Set("Content-Encoding", "gzip")
 	}
@@ -223,7 +265,7 @@ func (i *Ingestor) post(payload []byte) error {
 	if err != nil {
 		return fmt.Errorf("send payload: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("victoria metrics responded with status %d", resp.StatusCode)
@@ -231,16 +273,22 @@ func (i *Ingestor) post(payload []byte) error {
 	return nil
 }
 
-func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
-	req := env.req
+func (i *Ingestor) appendReport(buf, labelBuf *bytes.Buffer, scratch []byte, env reportEnvelope) {
+	if env.metricsReq != nil {
+		i.appendMetricsReport(buf, labelBuf, scratch, env.agentName, env.metricsReq)
+	} else if env.networkReq != nil {
+		i.appendNetworkReport(buf, labelBuf, scratch, env.agentName, env.networkReq)
+	}
+}
+
+func (i *Ingestor) appendMetricsReport(buf, labelBuf *bytes.Buffer, scratch []byte, agentName string, req *agentv1.MetricsReportRequest) {
 	if req == nil {
 		return
 	}
 
-	tsMillis := reportTimestampMillis(req)
-	agentName := env.agentName
+	tsMillis := reportTimestampMillis(req.TimestampSeconds)
 	if agentName == "" {
-		agentName = env.req.AgentId
+		agentName = req.AgentId
 	}
 	// Fallback
 	if agentName == "" {
@@ -248,23 +296,32 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 	}
 
 	meta := i.agentMeta[agentName]
-	base := baseLabels(agentName, env.req.ClusterId, "", meta) // ClusterName is not in V2 proto?
+	base := baseLabels(agentName, req.ClusterId, "", meta) // ClusterName is not in V2 proto?
 	// Wait, user proto: cluster_id = 2. No cluster_name.
 	// We'll leave clusterName empty or rely on agentMeta?
 	// The proto provided has: agent_id, cluster_id, node_name, availability_zone, timestamp_seconds, pods.
 	// No cluster_name.
 
 	// Report agent up
-	writeSample(buf, "clustercost_agent_up", base, "1", tsMillis)
+	labelBuf.Reset()
+	writeLabels(labelBuf, base)
+	baseLabelsBlob := labelBuf.Bytes() // Safe to use until labelBuf reset
+
+	writeFlagSample(buf, scratch, "clustercost_agent_up", baseLabelsBlob, 1, tsMillis)
 
 	// 2. Process Pods & Aggregate Namespace Data
 	type nsAgg struct {
-		hourlyCost      float64
-		podCount        int64
-		cpuUsageMilli   int64
-		memoryRssBytes  int64
-		cpuReqMilli     int64
-		memReqBytes     int64
+		hourlyCost     float64
+		podCount       int64
+		cpuUsageMilli  int64
+		memoryRssBytes int64
+		cpuReqMilli    int64
+		memReqBytes    int64
+		netTxBytes     int64
+		netRxBytes     int64
+		egressPublic   int64
+		egressCrossAZ  int64
+		egressInternal int64
 	}
 	// map[namespace]*nsAgg
 	nsMap := make(map[string]*nsAgg)
@@ -280,22 +337,22 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 	if instanceType == "" {
 		instanceType = "default"
 	}
-	vcpus := int64(0)
-	ramBytes := int64(0)
+	vcpus := safeInt64(0)
+	ramBytes := safeInt64(0)
 	if req.NodeName != "" {
 		for _, node := range req.Nodes {
 			if node == nil || node.NodeName != req.NodeName {
 				continue
 			}
 			if node.CapacityCpuMillicores > 0 {
-				vcpus = int64(node.CapacityCpuMillicores / 1000)
+				vcpus = safeInt64(node.CapacityCpuMillicores / 1000)
 			} else if node.AllocatableCpuMillicores > 0 {
-				vcpus = int64(node.AllocatableCpuMillicores / 1000)
+				vcpus = safeInt64(node.AllocatableCpuMillicores / 1000)
 			}
 			if node.CapacityMemoryBytes > 0 {
-				ramBytes = int64(node.CapacityMemoryBytes)
+				ramBytes = safeInt64(node.CapacityMemoryBytes)
 			} else if node.AllocatableMemoryBytes > 0 {
-				ramBytes = int64(node.AllocatableMemoryBytes)
+				ramBytes = safeInt64(node.AllocatableMemoryBytes)
 			}
 			break
 		}
@@ -319,7 +376,51 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 			region = req.AvailabilityZone
 		}
 
-		podLabels := appendLabels(base,
+		// Calculate Totals and Costs
+		// CPU
+		cpuUsageMilli := safeInt64(0)
+		cpuReq := safeInt64(0)
+		cpuLim := safeInt64(0)
+		if pod.Cpu != nil {
+			cpuUsageMilli = safeInt64(pod.Cpu.UsageMillicores)
+			if i.logLevel == "debug" {
+				if i.logger != nil && cpuUsageMilli == 0 {
+					i.logger.Printf("[DEBUG-CPU] Pod %s/%s has 0 CPU usage. Raw Proto: %+v", pod.Namespace, pod.PodName, pod.Cpu)
+				} else if i.logger != nil {
+					i.logger.Printf("[DEBUG-CPU] Pod %s/%s CPU Usage: %d", pod.Namespace, pod.PodName, cpuUsageMilli)
+				}
+			}
+			cpuReq = safeInt64(pod.Cpu.RequestMillicores)
+			cpuLim = safeInt64(pod.Cpu.LimitMillicores)
+		}
+
+		// Memory
+		memBytes := safeInt64(0)
+		memReq := safeInt64(0)
+		memLim := safeInt64(0)
+		if pod.Memory != nil {
+			memBytes = safeInt64(pod.Memory.RssBytes)
+			memReq = safeInt64(pod.Memory.RequestBytes)
+			memLim = safeInt64(pod.Memory.LimitBytes)
+		}
+
+		// Network
+		netTx := safeInt64(0)
+		netRx := safeInt64(0)
+		egressPublic := safeInt64(0)
+		egressCrossAZ := safeInt64(0)
+		egressInternal := safeInt64(0)
+		if pod.Network != nil {
+			netTx = safeInt64(pod.Network.BytesSent)
+			netRx = safeInt64(pod.Network.BytesReceived)
+			egressPublic = safeInt64(pod.Network.EgressPublicBytes)
+			egressCrossAZ = safeInt64(pod.Network.EgressCrossAzBytes)
+			egressInternal = safeInt64(pod.Network.EgressInternalBytes)
+		}
+
+		// Prepare cached labels for this pod
+		labelBuf.Reset()
+		writeLabels(labelBuf, base,
 			label{"namespace", pod.Namespace},
 			label{"pod", pod.PodName},
 			label{"node", nodeName},
@@ -328,54 +429,27 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 			label{"instance_type", req.InstanceType},
 			label{"environment", environment},
 		)
+		podLabelsBlob := labelBuf.Bytes()
 
-		// Calculate Totals and Costs
-		// CPU
-		cpuUsageMilli := int64(0)
-		cpuReq := int64(0)
-		cpuLim := int64(0)
-		if pod.Cpu != nil {
-			cpuUsageMilli = int64(pod.Cpu.UsageMillicores)
-			cpuReq = int64(pod.Cpu.RequestMillicores)
-			cpuLim = int64(pod.Cpu.LimitMillicores)
-		}
+		writeIntSample(buf, scratch, "clustercost_pod_cpu_usage_milli", podLabelsBlob, cpuUsageMilli, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_cpu_request_millicores", podLabelsBlob, cpuReq, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_cpu_limit_millicores", podLabelsBlob, cpuLim, tsMillis)
 
-		// Memory
-		memBytes := int64(0)
-		memReq := int64(0)
-		memLim := int64(0)
-		if pod.Memory != nil {
-			memBytes = int64(pod.Memory.RssBytes)
-			memReq = int64(pod.Memory.RequestBytes)
-			memLim = int64(pod.Memory.LimitBytes)
-		}
+		writeIntSample(buf, scratch, "clustercost_pod_memory_rss_bytes", podLabelsBlob, memBytes, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_memory_request_bytes", podLabelsBlob, memReq, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_memory_limit_bytes", podLabelsBlob, memLim, tsMillis)
 
-		// Network
-		netTx := int64(0)
-		netRx := int64(0)
-		egressPublic := int64(0)
-		if pod.Network != nil {
-			netTx = int64(pod.Network.BytesSent)
-			netRx = int64(pod.Network.BytesReceived)
-			egressPublic = int64(pod.Network.EgressPublicBytes)
-		}
-
-		writeSample(buf, "clustercost_pod_cpu_usage_milli", podLabels, formatInt(cpuUsageMilli), tsMillis)
-		writeSample(buf, "clustercost_pod_cpu_request_millicores", podLabels, formatInt(cpuReq), tsMillis)
-		writeSample(buf, "clustercost_pod_cpu_limit_millicores", podLabels, formatInt(cpuLim), tsMillis)
-
-		writeSample(buf, "clustercost_pod_memory_rss_bytes", podLabels, formatInt(memBytes), tsMillis)
-		writeSample(buf, "clustercost_pod_memory_request_bytes", podLabels, formatInt(memReq), tsMillis)
-		writeSample(buf, "clustercost_pod_memory_limit_bytes", podLabels, formatInt(memLim), tsMillis)
-
-		writeSample(buf, "clustercost_pod_network_tx_bytes_total", podLabels, formatInt(netTx), tsMillis)
-		writeSample(buf, "clustercost_pod_network_rx_bytes_total", podLabels, formatInt(netRx), tsMillis)
-		writeSample(buf, "clustercost_pod_network_egress_public_bytes_total", podLabels, formatInt(egressPublic), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_network_tx_bytes_total", podLabelsBlob, netTx, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_network_rx_bytes_total", podLabelsBlob, netRx, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_network_egress_public_bytes_total", podLabelsBlob, egressPublic, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_network_egress_cross_az_bytes_total", podLabelsBlob, egressCrossAZ, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_pod_network_egress_internal_bytes_total", podLabelsBlob, egressInternal, tsMillis)
 
 		cpuReqCores := float64(cpuReq) / 1000.0
 		memReqGB := float64(memReq) / (1024 * 1024 * 1024)
 		hourlyCost := (cpuReqCores * cpuPrice) + (memReqGB * memPrice)
-		writeSample(buf, "clustercost_pod_hourly_cost", podLabels, formatFloat(hourlyCost), tsMillis)
+
+		writeFloatSample(buf, scratch, "clustercost_pod_hourly_cost", podLabelsBlob, hourlyCost, tsMillis)
 
 		// Aggregate for Namespace
 		if nsMap[pod.Namespace] == nil {
@@ -387,72 +461,147 @@ func (i *Ingestor) appendReport(buf *bytes.Buffer, env reportEnvelope) {
 		agg.memoryRssBytes += memBytes
 		agg.hourlyCost += hourlyCost
 		agg.cpuReqMilli += cpuReq
-		agg.memReqBytes += memReq
+		agg.netTxBytes += netTx
+		agg.netRxBytes += netRx
+		agg.egressPublic += egressPublic
+		agg.egressCrossAZ += egressCrossAZ
+		agg.egressInternal += egressInternal
 	}
 
-	// 3. Emit Aggregated Namespace Metrics
+	// 3. Emit Aggregated Namespace Metrics & Calculate Cluster Totals
+	clusterTx := safeInt64(0)
+	clusterRx := safeInt64(0)
+	clusterEgressPublic := safeInt64(0)
+	clusterEgressCrossAZ := safeInt64(0)
+	clusterEgressInternal := safeInt64(0)
 	for ns, agg := range nsMap {
-		nsLabels := appendLabels(base,
+		clusterTx += agg.netTxBytes
+		clusterRx += agg.netRxBytes
+		clusterEgressPublic += agg.egressPublic
+		clusterEgressCrossAZ += agg.egressCrossAZ
+		clusterEgressInternal += agg.egressInternal
+
+		labelBuf.Reset()
+		writeLabels(labelBuf, base,
 			label{"namespace", ns},
 			label{"environment", "production"},
 		)
-		writeSample(buf, "clustercost_namespace_pod_count", nsLabels, formatInt(agg.podCount), tsMillis)
-		writeSample(buf, "clustercost_namespace_cpu_usage_milli", nsLabels, formatInt(agg.cpuUsageMilli), tsMillis)
-		writeSample(buf, "clustercost_namespace_memory_rss_bytes_total", nsLabels, formatInt(agg.memoryRssBytes), tsMillis)
-		writeSample(buf, "clustercost_namespace_hourly_cost", nsLabels, formatFloat(agg.hourlyCost), tsMillis)
-		writeSample(buf, "clustercost_namespace_cpu_request_millicores", nsLabels, formatInt(agg.cpuReqMilli), tsMillis)
-		writeSample(buf, "clustercost_namespace_memory_request_bytes", nsLabels, formatInt(agg.memReqBytes), tsMillis)
+		nsLabelsBlob := labelBuf.Bytes()
+
+		writeIntSample(buf, scratch, "clustercost_namespace_pod_count", nsLabelsBlob, agg.podCount, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_cpu_usage_milli", nsLabelsBlob, agg.cpuUsageMilli, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_memory_rss_bytes_total", nsLabelsBlob, agg.memoryRssBytes, tsMillis)
+		writeFloatSample(buf, scratch, "clustercost_namespace_hourly_cost", nsLabelsBlob, agg.hourlyCost, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_cpu_request_millicores", nsLabelsBlob, agg.cpuReqMilli, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_memory_request_bytes", nsLabelsBlob, agg.memReqBytes, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_network_tx_bytes_total", nsLabelsBlob, agg.netTxBytes, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_network_rx_bytes_total", nsLabelsBlob, agg.netRxBytes, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_network_egress_public_bytes_total", nsLabelsBlob, agg.egressPublic, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_network_egress_cross_az_bytes_total", nsLabelsBlob, agg.egressCrossAZ, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_namespace_network_egress_internal_bytes_total", nsLabelsBlob, agg.egressInternal, tsMillis)
 	}
+
+	// Cluster totals will be emitted after Node processing
 
 	// 3b. Emit Node Metrics
 	for _, node := range req.Nodes {
 		if node == nil || node.NodeName == "" {
 			continue
 		}
-		nodeLabels := appendLabels(base, label{"node", node.NodeName})
+		labelBuf.Reset()
+		writeLabels(labelBuf, base, label{"node", node.NodeName})
 		if node.NodeName == req.NodeName && req.InstanceType != "" {
-			nodeLabels = appendLabels(nodeLabels, label{"instance_type", req.InstanceType})
+			writeLabel(labelBuf, label{"instance_type", req.InstanceType})
 		}
+		nodeLabelsBlob := labelBuf.Bytes()
 
-		writeSample(buf, "clustercost_node_cpu_usage_milli", nodeLabels, formatUint(node.CpuUsageMillicores), tsMillis)
-		writeSample(buf, "clustercost_node_memory_usage_bytes", nodeLabels, formatUint(node.MemoryUsageBytes), tsMillis)
-		writeSample(buf, "clustercost_node_cpu_capacity_milli", nodeLabels, formatUint(node.CapacityCpuMillicores), tsMillis)
-		writeSample(buf, "clustercost_node_memory_capacity_bytes", nodeLabels, formatUint(node.CapacityMemoryBytes), tsMillis)
-		writeSample(buf, "clustercost_node_cpu_allocatable_milli", nodeLabels, formatUint(node.AllocatableCpuMillicores), tsMillis)
-		writeSample(buf, "clustercost_node_memory_allocatable_bytes", nodeLabels, formatUint(node.AllocatableMemoryBytes), tsMillis)
-		writeSample(buf, "clustercost_node_cpu_requested_milli", nodeLabels, formatUint(node.RequestedCpuMillicores), tsMillis)
-		writeSample(buf, "clustercost_node_memory_requested_bytes", nodeLabels, formatUint(node.RequestedMemoryBytes), tsMillis)
-		writeSample(buf, "clustercost_node_cpu_throttling_ns_total", nodeLabels, formatUint(node.ThrottlingNs), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_cpu_usage_milli", nodeLabelsBlob, safeInt64(node.CpuUsageMillicores), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_memory_usage_bytes", nodeLabelsBlob, safeInt64(node.MemoryUsageBytes), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_cpu_capacity_milli", nodeLabelsBlob, safeInt64(node.CapacityCpuMillicores), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_memory_capacity_bytes", nodeLabelsBlob, safeInt64(node.CapacityMemoryBytes), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_cpu_allocatable_milli", nodeLabelsBlob, safeInt64(node.AllocatableCpuMillicores), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_memory_allocatable_bytes", nodeLabelsBlob, safeInt64(node.AllocatableMemoryBytes), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_cpu_requested_milli", nodeLabelsBlob, safeInt64(node.RequestedCpuMillicores), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_memory_requested_bytes", nodeLabelsBlob, safeInt64(node.RequestedMemoryBytes), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_node_cpu_throttling_ns_total", nodeLabelsBlob, safeInt64(node.ThrottlingNs), tsMillis)
 
 		if node.AllocatableCpuMillicores > 0 {
 			cpuPct := (float64(node.CpuUsageMillicores) / float64(node.AllocatableCpuMillicores)) * 100
-			writeSample(buf, "clustercost_node_cpu_usage_percent", nodeLabels, formatFloat(cpuPct), tsMillis)
+			writeFloatSample(buf, scratch, "clustercost_node_cpu_usage_percent", nodeLabelsBlob, cpuPct, tsMillis)
 		}
 		if node.AllocatableMemoryBytes > 0 {
 			memPct := (float64(node.MemoryUsageBytes) / float64(node.AllocatableMemoryBytes)) * 100
-			writeSample(buf, "clustercost_node_memory_usage_percent", nodeLabels, formatFloat(memPct), tsMillis)
+			writeFloatSample(buf, scratch, "clustercost_node_memory_usage_percent", nodeLabelsBlob, memPct, tsMillis)
+		}
+
+		// Node Network Metrics (Host Traffic)
+		if node.Network != nil {
+			nodeTx := safeInt64(node.Network.BytesSent)
+			nodeRx := safeInt64(node.Network.BytesReceived)
+			nodeEgressPublic := safeInt64(node.Network.EgressPublicBytes)
+			nodeEgressCrossAZ := safeInt64(node.Network.EgressCrossAzBytes)
+			nodeEgressInternal := safeInt64(node.Network.EgressInternalBytes)
+
+			writeIntSample(buf, scratch, "clustercost_node_network_tx_bytes_total", nodeLabelsBlob, nodeTx, tsMillis)
+			writeIntSample(buf, scratch, "clustercost_node_network_rx_bytes_total", nodeLabelsBlob, nodeRx, tsMillis)
+			writeIntSample(buf, scratch, "clustercost_node_network_egress_public_bytes_total", nodeLabelsBlob, nodeEgressPublic, tsMillis)
+			writeIntSample(buf, scratch, "clustercost_node_network_egress_cross_az_bytes_total", nodeLabelsBlob, nodeEgressCrossAZ, tsMillis)
+			writeIntSample(buf, scratch, "clustercost_node_network_egress_internal_bytes_total", nodeLabelsBlob, nodeEgressInternal, tsMillis)
+
+			// Aggregate Node Traffic to Cluster Totals
+			clusterTx += nodeTx
+			clusterRx += nodeRx
+			clusterEgressPublic += nodeEgressPublic
+			clusterEgressCrossAZ += nodeEgressCrossAZ
+			clusterEgressInternal += nodeEgressInternal
 		}
 	}
 
-	// 4. Emit Connection-Level Network Metrics
-	var totalTx uint64
-	var totalRx uint64
-	for _, conn := range req.Connections {
-		if conn == nil {
+	// 4. Emit Cluster Totals (Pod + Node)
+	if clusterTx > 0 || clusterRx > 0 {
+		writeIntSample(buf, scratch, "clustercost_cluster_network_tx_bytes_total", baseLabelsBlob, clusterTx, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_cluster_network_rx_bytes_total", baseLabelsBlob, clusterRx, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_cluster_network_egress_public_bytes_total", baseLabelsBlob, clusterEgressPublic, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_cluster_network_egress_cross_az_bytes_total", baseLabelsBlob, clusterEgressCrossAZ, tsMillis)
+		writeIntSample(buf, scratch, "clustercost_cluster_network_egress_internal_bytes_total", baseLabelsBlob, clusterEgressInternal, tsMillis)
+	}
+
+}
+
+func (i *Ingestor) appendNetworkReport(buf, labelBuf *bytes.Buffer, scratch []byte, agentName string, req *agentv1.NetworkReportRequest) {
+	if req == nil {
+		return
+	}
+	tsMillis := reportTimestampMillis(req.TimestampSeconds)
+	if agentName == "" {
+		agentName = req.AgentId
+	}
+	if agentName == "" {
+		agentName = "unknown"
+	}
+	meta := i.agentMeta[agentName]
+	base := baseLabels(agentName, req.ClusterId, "", meta)
+
+	// Decode Compact Connections
+	endpoints := req.Endpoints
+	for _, compact := range req.CompactConnections {
+		if compact == nil {
 			continue
 		}
+		if int(compact.SrcIndex) >= len(endpoints) || int(compact.DstIndex) >= len(endpoints) {
+			continue // Invalid index
+		}
+		src := endpoints[compact.SrcIndex]
+		dst := endpoints[compact.DstIndex]
 
-		labels := connectionLabels(base, conn)
-		writeSample(buf, "clustercost_connection_bytes_sent_total", labels, formatUint(conn.BytesSent), tsMillis)
-		writeSample(buf, "clustercost_connection_bytes_received_total", labels, formatUint(conn.BytesReceived), tsMillis)
+		// Build full connection object for label generation
+		labelBuf.Reset()
+		// Use specialized compact writer to avoid allocs
+		writeCompactLabels(labelBuf, base, compact, src, dst)
+		labelsBlob := labelBuf.Bytes()
 
-		totalTx += conn.BytesSent
-		totalRx += conn.BytesReceived
-	}
-
-	if totalTx > 0 || totalRx > 0 {
-		writeSample(buf, "clustercost_cluster_network_tx_bytes_total", base, formatUint(totalTx), tsMillis)
-		writeSample(buf, "clustercost_cluster_network_rx_bytes_total", base, formatUint(totalRx), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_connection_bytes_sent_total", labelsBlob, safeInt64(compact.BytesSent), tsMillis)
+		writeIntSample(buf, scratch, "clustercost_connection_bytes_received_total", labelsBlob, safeInt64(compact.BytesReceived), tsMillis)
 	}
 }
 
@@ -507,110 +656,108 @@ func baseLabels(agentName, clusterID, clusterName string, meta agentMetadata) []
 	return labels
 }
 
-func appendLabels(base []label, extra ...label) []label {
-	if len(extra) == 0 {
-		return base
-	}
-	labels := make([]label, 0, len(base)+len(extra))
-	labels = append(labels, base...)
-	for _, item := range extra {
-		if strings.TrimSpace(item.value) == "" {
-			continue
-		}
-		labels = append(labels, item)
-	}
-	return labels
-}
-
-func writeSample(buf *bytes.Buffer, name string, labels []label, value string, tsMillis int64) {
-	if name == "" || value == "" {
-		return
-	}
+func writeIntSample(buf *bytes.Buffer, scratch []byte, name string, labels []byte, value int64, tsMillis int64) {
 	buf.WriteString(name)
 	if len(labels) > 0 {
 		buf.WriteByte('{')
-		for idx, item := range labels {
-			if idx > 0 {
-				buf.WriteByte(',')
-			}
-			buf.WriteString(item.key)
-			buf.WriteString(`="`)
-			buf.WriteString(escapeLabelValue(item.value))
-			buf.WriteByte('"')
-		}
+		buf.Write(labels)
 		buf.WriteByte('}')
 	}
 	buf.WriteByte(' ')
-	buf.WriteString(value)
+	buf.Write(strconv.AppendInt(scratch[:0], value, 10))
 	buf.WriteByte(' ')
-	buf.WriteString(strconv.FormatInt(tsMillis, 10))
+	buf.Write(strconv.AppendInt(scratch[:0], tsMillis, 10))
 	buf.WriteByte('\n')
 }
 
-func formatFloat(value float64) string {
-	return strconv.FormatFloat(value, 'f', -1, 64)
+func writeFlagSample(buf *bytes.Buffer, scratch []byte, name string, labels []byte, value int64, tsMillis int64) {
+	writeIntSample(buf, scratch, name, labels, value, tsMillis)
 }
 
-func formatInt(value int64) string {
-	return strconv.FormatInt(value, 10)
-}
-
-func formatUint(value uint64) string {
-	return strconv.FormatUint(value, 10)
-}
-
-func formatBool(value bool) string {
-	if value {
-		return "1"
+func writeFloatSample(buf *bytes.Buffer, scratch []byte, name string, labels []byte, value float64, tsMillis int64) {
+	buf.WriteString(name)
+	if len(labels) > 0 {
+		buf.WriteByte('{')
+		buf.Write(labels)
+		buf.WriteByte('}')
 	}
-	return "0"
+	buf.WriteByte(' ')
+	buf.Write(strconv.AppendFloat(scratch[:0], value, 'f', -1, 64))
+	buf.WriteByte(' ')
+	buf.Write(strconv.AppendInt(scratch[:0], tsMillis, 10))
+	buf.WriteByte('\n')
 }
 
-func reportTimestampMillis(req *agentv1.ReportRequest) int64 {
-	if req != nil && req.TimestampSeconds > 0 {
-		return req.TimestampSeconds * 1000
+func writeLabels(buf *bytes.Buffer, base []label, extra ...label) {
+	first := true
+	for _, l := range base {
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		writeLabelKV(buf, l.key, l.value)
 	}
-	return time.Now().UnixMilli()
-}
-
-func connectionLabels(base []label, conn *agentv1.NetworkConnection) []label {
-	if conn == nil {
-		return base
-	}
-
-	labels := appendLabels(base,
-		label{"protocol", strconv.FormatUint(uint64(conn.Protocol), 10)},
-		label{"egress_class", conn.EgressClass},
-		label{"dst_kind", conn.DstKind},
-		label{"service_match", conn.ServiceMatch},
-		label{"is_egress", strconv.FormatBool(conn.IsEgress)},
-	)
-
-	if conn.Src != nil {
-		labels = appendLabels(labels, endpointLabels("src", conn.Src)...)
-	}
-	if conn.Dst != nil {
-		labels = appendLabels(labels, endpointLabels("dst", conn.Dst)...)
-		services := joinServiceRefs(conn.Dst.Services)
-		if services != "" {
-			labels = appendLabels(labels, label{"dst_services", services})
+	for _, l := range extra {
+		if strings.TrimSpace(l.value) != "" {
+			if !first {
+				buf.WriteByte(',')
+			}
+			first = false
+			writeLabelKV(buf, l.key, l.value)
 		}
 	}
-	return labels
 }
 
-func endpointLabels(prefix string, ep *agentv1.NetworkEndpoint) []label {
-	if ep == nil {
-		return nil
+func writeLabel(buf *bytes.Buffer, l label) {
+	if buf.Len() > 0 {
+		buf.WriteByte(',')
 	}
-	return []label{
-		{prefix + "_ip", ep.Ip},
-		{prefix + "_namespace", ep.Namespace},
-		{prefix + "_pod", ep.PodName},
-		{prefix + "_node", ep.NodeName},
-		{prefix + "_availability_zone", ep.AvailabilityZone},
-		{prefix + "_dns_name", ep.DnsName},
+	writeLabelKV(buf, l.key, l.value)
+}
+
+func writeLabelKV(buf *bytes.Buffer, k, v string) {
+	buf.WriteString(k)
+	buf.WriteString(`="`)
+	_, _ = labelReplacer.WriteString(buf, v) // Uses global replacer and writes directly to buffer
+	buf.WriteByte('"')
+}
+
+func writeCompactLabels(buf *bytes.Buffer, base []label, compact *agentv1.CompactNetworkConnection, src, dst *agentv1.NetworkEndpoint) {
+	writeLabels(buf, base) // Writes base labels
+
+	// Write extra manually
+	writeLabel(buf, label{"protocol", strconv.FormatUint(uint64(compact.Protocol), 10)})
+	writeLabel(buf, label{"egress_class", compact.EgressClass})
+	writeLabel(buf, label{"dst_kind", compact.DstKind})
+	writeLabel(buf, label{"service_match", compact.ServiceMatch})
+	writeLabel(buf, label{"is_egress", strconv.FormatBool(compact.IsEgress)})
+
+	if src != nil {
+		writeEndpointLabels(buf, "src", src)
 	}
+	if dst != nil {
+		writeEndpointLabels(buf, "dst", dst)
+		services := joinServiceRefs(dst.Services)
+		if services != "" {
+			writeLabel(buf, label{"dst_services", services})
+		}
+	}
+}
+
+func writeEndpointLabels(buf *bytes.Buffer, prefix string, ep *agentv1.NetworkEndpoint) {
+	writeLabel(buf, label{prefix + "_ip", ep.Ip})
+	writeLabel(buf, label{prefix + "_namespace", ep.Namespace})
+	writeLabel(buf, label{prefix + "_pod", ep.PodName})
+	writeLabel(buf, label{prefix + "_node", ep.NodeName})
+	writeLabel(buf, label{prefix + "_availability_zone", ep.AvailabilityZone})
+	writeLabel(buf, label{prefix + "_dns_name", ep.DnsName})
+}
+
+func reportTimestampMillis(tsSeconds int64) int64 {
+	if tsSeconds > 0 {
+		return tsSeconds * 1000
+	}
+	return time.Now().UnixMilli()
 }
 
 func joinServiceRefs(services []*agentv1.ServiceRef) string {

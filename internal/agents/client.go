@@ -71,7 +71,7 @@ func (c *Client) get(ctx context.Context, baseURL, endpoint string, target any) 
 	if err != nil {
 		return fmt.Errorf("call agent: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return fmt.Errorf("agent responded with status %d", res.StatusCode)

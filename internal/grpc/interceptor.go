@@ -16,10 +16,11 @@ import (
 type AuthInterceptor struct {
 	validTokens  map[string]string // map[token]agentName
 	defaultToken string
+	logLevel     string
 }
 
 // NewAuthInterceptor creates a new interceptor with the valid tokens from config.
-func NewAuthInterceptor(agents []config.AgentConfig, defaultToken string) *AuthInterceptor {
+func NewAuthInterceptor(agents []config.AgentConfig, defaultToken, logLevel string) *AuthInterceptor {
 	validTokens := make(map[string]string)
 	for _, agent := range agents {
 		if agent.Token != "" {
@@ -29,16 +30,21 @@ func NewAuthInterceptor(agents []config.AgentConfig, defaultToken string) *AuthI
 	return &AuthInterceptor{
 		validTokens:  validTokens,
 		defaultToken: defaultToken,
+		logLevel:     logLevel,
 	}
 }
 
 // Unary returns a UnaryServerInterceptor that validates the token.
 func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		log.Printf("[gRPC] Received request: %s", info.FullMethod)
+		if i.logLevel == "debug" {
+			log.Printf("[gRPC] Received request: %s", info.FullMethod)
+		}
 
 		if len(i.validTokens) == 0 && i.defaultToken == "" {
-			log.Println("[gRPC] No tokens configured, allowing unauthenticated request")
+			if i.logLevel == "debug" {
+				log.Println("[gRPC] No tokens configured, allowing unauthenticated request")
+			}
 			// If no tokens are configured, allow unauthenticated access.
 			return handler(ctx, req)
 		}
@@ -59,7 +65,9 @@ func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 
 		// Check default token first
 		if i.defaultToken != "" && accessToken == i.defaultToken {
-			log.Println("[gRPC] Authenticated with default token")
+			if i.logLevel == "debug" {
+				log.Println("[gRPC] Authenticated with default token")
+			}
 			// If default token is used, we might not know the agent name yet.
 			// It will be extracted from the request body in the handler.
 			return handler(ctx, req)
@@ -68,9 +76,13 @@ func (i *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
 		// Check specific agent tokens
 		agentName, ok := i.validTokens[accessToken]
 		if ok {
-			log.Printf("[gRPC] Authenticated agent: %s", agentName)
+			if i.logLevel == "debug" {
+				log.Printf("[gRPC] Authenticated agent: %s", agentName)
+			}
 			// Inject agent name into context
-			newCtx := context.WithValue(ctx, "agent_name", agentName)
+			type contextKey string
+			const agentNameKey contextKey = "agent_name"
+			newCtx := context.WithValue(ctx, agentNameKey, agentName)
 			return handler(newCtx, req)
 		}
 

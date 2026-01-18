@@ -10,28 +10,34 @@ import (
 )
 
 func TestAppendReportConnectionsEmitsMetrics(t *testing.T) {
-	req := &agentv1.ReportRequest{
+	endpoints := []*agentv1.NetworkEndpoint{
+		{
+			Ip:               "10.0.0.1",
+			DnsName:          "api.internal.local",
+			Namespace:        "default",
+			PodName:          "pod-a",
+			NodeName:         "node-a",
+			AvailabilityZone: "us-east-1a",
+		},
+		{
+			Ip:               "1.1.1.1",
+			DnsName:          "api.example.com",
+			AvailabilityZone: "us-east-1a",
+			Services: []*agentv1.ServiceRef{
+				{Namespace: "default", Name: "api"},
+			},
+		},
+	}
+
+	req := &agentv1.NetworkReportRequest{
 		AgentId:          "agent-1",
 		ClusterId:        "cluster-1",
 		TimestampSeconds: 1700000000,
-		Connections: []*agentv1.NetworkConnection{
+		Endpoints:        endpoints,
+		CompactConnections: []*agentv1.CompactNetworkConnection{
 			{
-				Src: &agentv1.NetworkEndpoint{
-					Ip:               "10.0.0.1",
-					DnsName:          "api.internal.local",
-					Namespace:        "default",
-					PodName:          "pod-a",
-					NodeName:         "node-a",
-					AvailabilityZone: "us-east-1a",
-				},
-				Dst: &agentv1.NetworkEndpoint{
-					Ip:               "1.1.1.1",
-					DnsName:          "api.example.com",
-					AvailabilityZone: "us-east-1a",
-					Services: []*agentv1.ServiceRef{
-						{Namespace: "default", Name: "api"},
-					},
-				},
+				SrcIndex:      0,
+				DstIndex:      1,
 				Protocol:      6,
 				BytesSent:     100,
 				BytesReceived: 200,
@@ -41,6 +47,8 @@ func TestAppendReportConnectionsEmitsMetrics(t *testing.T) {
 				IsEgress:      true,
 			},
 			{
+				SrcIndex:      0,
+				DstIndex:      1, // reusing for simplicity
 				Protocol:      17,
 				BytesSent:     300,
 				BytesReceived: 400,
@@ -50,7 +58,7 @@ func TestAppendReportConnectionsEmitsMetrics(t *testing.T) {
 
 	ing := &Ingestor{}
 	var buf bytes.Buffer
-	ing.appendReport(&buf, reportEnvelope{agentName: "agent-1", req: req})
+	ing.appendReport(&buf, &bytes.Buffer{}, make([]byte, 64), reportEnvelope{agentName: "agent-1", networkReq: req})
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	connLine := findMetricLine(lines, "clustercost_connection_bytes_sent_total")
@@ -84,32 +92,13 @@ func TestAppendReportConnectionsEmitsMetrics(t *testing.T) {
 	assertLabel(t, labels, "dst_dns_name", "api.example.com")
 	assertLabel(t, labels, "dst_services", "default/api")
 
-	txLine := findMetricLine(lines, "clustercost_cluster_network_tx_bytes_total")
-	if txLine == "" {
-		t.Fatalf("expected cluster tx bytes metric in output")
-	}
-	_, _, txValue, ts := parseMetricLine(t, txLine)
-	if txValue != "400" {
-		t.Fatalf("expected cluster tx bytes 400, got %s", txValue)
-	}
-	if ts != 1700000000000 {
-		t.Fatalf("expected timestamp 1700000000000, got %d", ts)
-	}
-
-	rxLine := findMetricLine(lines, "clustercost_cluster_network_rx_bytes_total")
-	if rxLine == "" {
-		t.Fatalf("expected cluster rx bytes metric in output")
-	}
-	_, _, rxValue, _ := parseMetricLine(t, rxLine)
-	if rxValue != "600" {
-		t.Fatalf("expected cluster rx bytes 600, got %s", rxValue)
-	}
+	// Cluster metrics now aggregated in MetricsReport, not NetworkReport
 
 	// Egress cost metrics removed from the proto; bytes-only aggregation remains.
 }
 
 func TestAppendReportEmitsNodeMetrics(t *testing.T) {
-	req := &agentv1.ReportRequest{
+	req := &agentv1.MetricsReportRequest{
 		AgentId:          "agent-1",
 		ClusterId:        "cluster-1",
 		TimestampSeconds: 1700000000,
@@ -131,7 +120,7 @@ func TestAppendReportEmitsNodeMetrics(t *testing.T) {
 
 	ing := &Ingestor{}
 	var buf bytes.Buffer
-	ing.appendReport(&buf, reportEnvelope{agentName: "agent-1", req: req})
+	ing.appendReport(&buf, &bytes.Buffer{}, make([]byte, 64), reportEnvelope{agentName: "agent-1", metricsReq: req})
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	cpuLine := findMetricLine(lines, "clustercost_node_cpu_usage_milli")
@@ -166,7 +155,7 @@ func TestAppendReportEmitsNodeMetrics(t *testing.T) {
 }
 
 func TestAppendReportEmitsPodAndNamespaceHourlyCost(t *testing.T) {
-	req := &agentv1.ReportRequest{
+	req := &agentv1.MetricsReportRequest{
 		AgentId:          "agent-1",
 		ClusterId:        "cluster-1",
 		NodeName:         "node-a",
@@ -190,13 +179,17 @@ func TestAppendReportEmitsPodAndNamespaceHourlyCost(t *testing.T) {
 				Memory: &agentv1.MemoryMetrics{
 					RequestBytes: 1024 * 1024 * 1024,
 				},
+				Network: &agentv1.NetworkMetrics{
+					BytesSent:     1000,
+					BytesReceived: 2000,
+				},
 			},
 		},
 	}
 
 	ing := &Ingestor{}
 	var buf bytes.Buffer
-	ing.appendReport(&buf, reportEnvelope{agentName: "agent-1", req: req})
+	ing.appendReport(&buf, &bytes.Buffer{}, make([]byte, 64), reportEnvelope{agentName: "agent-1", metricsReq: req})
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	podCostLine := findMetricLine(lines, "clustercost_pod_hourly_cost")
@@ -239,8 +232,7 @@ func TestAppendReportEmitsPodAndNamespaceHourlyCost(t *testing.T) {
 }
 
 func TestReportTimestampMillisUsesReportTimestamp(t *testing.T) {
-	req := &agentv1.ReportRequest{TimestampSeconds: 1700001234}
-	got := reportTimestampMillis(req)
+	got := reportTimestampMillis(1700001234)
 	if got != 1700001234000 {
 		t.Fatalf("expected timestamp seconds converted to ms, got %d", got)
 	}
@@ -293,5 +285,95 @@ func assertLabel(t *testing.T, labels map[string]string, key, expected string) {
 	t.Helper()
 	if labels[key] != expected {
 		t.Fatalf("expected label %s=%s, got %s", key, expected, labels[key])
+	}
+}
+
+func TestReportEmitsEgressBreakdownMetrics(t *testing.T) {
+	req := &agentv1.MetricsReportRequest{
+		AgentId:          "agent-1",
+		TimestampSeconds: 1700000000,
+		Pods: []*agentv1.PodMetric{
+			{
+				Namespace: "backend",
+				PodName:   "api-1",
+				Network: &agentv1.NetworkMetrics{
+					BytesSent:           1000,
+					BytesReceived:       2000,
+					EgressPublicBytes:   500,
+					EgressCrossAzBytes:  300,
+					EgressInternalBytes: 200,
+				},
+			},
+		},
+	}
+
+	ing := &Ingestor{}
+	var buf bytes.Buffer
+	ing.appendReport(&buf, &bytes.Buffer{}, make([]byte, 64), reportEnvelope{agentName: "agent-1", metricsReq: req})
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+
+	// Verify Pod Metrics
+	checkMetric(t, lines, "clustercost_pod_network_egress_public_bytes_total", "500")
+	checkMetric(t, lines, "clustercost_pod_network_egress_cross_az_bytes_total", "300")
+	checkMetric(t, lines, "clustercost_pod_network_egress_internal_bytes_total", "200")
+
+	// Verify Namespace Metrics
+	checkMetric(t, lines, "clustercost_namespace_network_egress_public_bytes_total", "500")
+	checkMetric(t, lines, "clustercost_namespace_network_egress_cross_az_bytes_total", "300")
+	checkMetric(t, lines, "clustercost_namespace_network_egress_internal_bytes_total", "200")
+
+	// Verify Cluster Metrics
+	checkMetric(t, lines, "clustercost_cluster_network_egress_public_bytes_total", "500")
+	checkMetric(t, lines, "clustercost_cluster_network_egress_cross_az_bytes_total", "300")
+	checkMetric(t, lines, "clustercost_cluster_network_egress_internal_bytes_total", "200")
+}
+
+func TestReportEmitsNodeNetworkMetrics(t *testing.T) {
+	req := &agentv1.MetricsReportRequest{
+		AgentId:          "agent-1",
+		TimestampSeconds: 1700000000,
+		Nodes: []*agentv1.NodeMetric{
+			{
+				NodeName: "node-1",
+				Network: &agentv1.NetworkMetrics{
+					BytesSent:           100,
+					BytesReceived:       200,
+					EgressPublicBytes:   50,
+					EgressCrossAzBytes:  30,
+					EgressInternalBytes: 20,
+				},
+			},
+		},
+	}
+
+	ing := &Ingestor{}
+	var buf bytes.Buffer
+	ing.appendReport(&buf, &bytes.Buffer{}, make([]byte, 64), reportEnvelope{agentName: "agent-1", metricsReq: req})
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+
+	// Verify Node Metrics
+	checkMetric(t, lines, "clustercost_node_network_tx_bytes_total", "100")
+	checkMetric(t, lines, "clustercost_node_network_rx_bytes_total", "200")
+	checkMetric(t, lines, "clustercost_node_network_egress_public_bytes_total", "50")
+
+	// Verify Cluster Aggregation (Should contain Node metrics)
+	checkMetric(t, lines, "clustercost_cluster_network_tx_bytes_total", "100")
+	checkMetric(t, lines, "clustercost_cluster_network_egress_public_bytes_total", "50")
+}
+
+func checkMetric(t *testing.T, lines []string, name, expectedVal string) {
+	t.Helper()
+	line := findMetricLine(lines, name)
+	if line == "" {
+		t.Fatalf("metric %s not found", name)
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		t.Fatalf("invalid metric line: %s", line)
+	}
+	if fields[1] != expectedVal {
+		t.Errorf("metric %s: expected %s, got %s", name, expectedVal, fields[1])
 	}
 }

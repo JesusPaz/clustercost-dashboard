@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"time"
 )
 
 type summaryResponse struct {
@@ -76,25 +77,25 @@ func main() {
 		writeJSON(w, []map[string]any{
 			{
 				"namespace":          "payments",
-				"team":                "backend",
-				"env":                 "prod",
-				"hourlyCost":          4.2,
-				"cpuRequestedCores":   3.5,
-				"cpuUsedCores":        2.8,
-				"memoryRequestedGiB":  8,
-				"memoryUsedGiB":       6.4,
-				"podCount":            23,
+				"team":               "backend",
+				"env":                "prod",
+				"hourlyCost":         4.2,
+				"cpuRequestedCores":  3.5,
+				"cpuUsedCores":       2.8,
+				"memoryRequestedGiB": 8,
+				"memoryUsedGiB":      6.4,
+				"podCount":           23,
 			},
 			{
 				"namespace":          "api",
-				"team":                "platform",
-				"env":                 "prod",
-				"hourlyCost":          3.5,
-				"cpuRequestedCores":   2.7,
-				"cpuUsedCores":        2.2,
-				"memoryRequestedGiB":  6,
-				"memoryUsedGiB":       4.8,
-				"podCount":            18,
+				"team":               "platform",
+				"env":                "prod",
+				"hourlyCost":         3.5,
+				"cpuRequestedCores":  2.7,
+				"cpuUsedCores":       2.2,
+				"memoryRequestedGiB": 6,
+				"memoryUsedGiB":      4.8,
+				"podCount":           18,
 			},
 		})
 	})
@@ -152,7 +153,12 @@ func main() {
 	})
 
 	log.Printf("mock agent listening on %s", *listen)
-	log.Fatal(http.ListenAndServe(*listen, mux))
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {
