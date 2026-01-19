@@ -1,6 +1,9 @@
 import type { Environment } from "./utils";
 
-const API_PREFIX = "/api";
+// Allow overriding the API base via env var (useful for production builds or direct CORS)
+// If VITE_API_URL is set (e.g. "https://api.example.com"), we use that. 
+// Otherwise default to local proxy "/api".
+const API_PREFIX = import.meta.env.VITE_API_URL || "/api";
 
 const normalizeEnvironment = (value?: string): Environment => {
   switch ((value || "").toLowerCase()) {
@@ -112,6 +115,10 @@ type NodeCostApi = {
   hourlyCost: number;
   cpuUsagePercent: number;
   memoryUsagePercent: number;
+  cpuRequestedMilli?: number;
+  cpuLimitMilli?: number;
+  memoryRequestedBytes?: number;
+  memoryLimitBytes?: number;
   cpuAllocatableMilli?: number;
   memoryAllocatableBytes?: number;
   podCount: number;
@@ -339,6 +346,19 @@ export const fetchNodes = async (): Promise<NodeCost[]> => {
     taints: node.taints ?? [],
     lastUpdated: resp.timestamp
   }));
+};
+
+export interface NodeStats {
+  nodeName: string;
+  p95CpuUsagePercent: number;
+  p95MemoryUsagePercent: number;
+  totalMonthlyCost: number;
+  realUsageMonthlyCost: number;
+  window: string;
+}
+
+export const fetchNodeStats = async (name: string, window: string): Promise<NodeStats> => {
+  return request<NodeStats>(`/cost/nodes/${name}/stats?window=${window}`);
 };
 
 export const fetchResources = async (): Promise<ResourcesSummary> => {

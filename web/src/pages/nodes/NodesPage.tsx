@@ -1,365 +1,310 @@
 import { useMemo, useState, type ChangeEvent } from "react";
 import { fetchNodes, type NodeCost } from "../../lib/api";
-import { formatCurrency, formatPercentage, relativeTimeFromIso, toMonthlyCost } from "../../lib/utils";
+import { formatCurrency, formatPercentage, relativeTimeFromIso, toMonthlyCost, milliToCores } from "../../lib/utils";
 import { useApiData } from "../../hooks/useApiData";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
 import NodeDetailSheet from "@/components/nodes/NodeDetailSheet";
+import { MetricCard } from "@/components/common/MetricCard";
+import { EfficiencyBar } from "@/components/nodes/EfficiencyBar";
+import { AlertTriangleIcon, CheckCircle2Icon, SearchIcon, ArrowDownIcon } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
-const statusStyles: Record<NodeCost["status"], string> = {
-  Ready: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
-  NotReady: "border-destructive/40 bg-destructive/10 text-destructive",
-  Unknown: "border-muted bg-muted/40 text-muted-foreground"
-};
-
-type SortKey = "cost" | "cpu" | "memory";
+type SortKey = "cost" | "waste" | "efficiency";
 
 const NodesPage = () => {
   const { data, loading, error, refresh } = useApiData(fetchNodes);
   const nodes = data ?? [];
   const [search, setSearch] = useState("");
-  const [sortKey, setSortKey] = useState<SortKey>("cost");
+  const [sortKey, setSortKey] = useState<SortKey>("waste");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [selectedNode, setSelectedNode] = useState<(NodeCost & { monthlyCost: number }) | null>(null);
 
+  // Fallback Cost Logic
+  const getEstimatedCost = (instanceType: string | undefined): number => {
+    if (!instanceType) return 73;
+    if (instanceType.includes("nano")) return 4;
+    if (instanceType.includes("micro")) return 8;
+    if (instanceType.includes("small")) return 16;
+    if (instanceType.includes("medium")) return 32;
+    if (instanceType.includes("large") && !instanceType.includes("xlarge")) return 64;
+    if (instanceType.includes("xlarge")) return 128;
+    if (instanceType.includes("2xlarge")) return 256;
+    return 73;
+  };
+
   const derivedNodes = useMemo(() => {
-    return nodes.map((node) => ({
-      ...node,
-      cpuUsagePercent: node.cpuUsagePercent ?? 0,
-      memoryUsagePercent: node.memoryUsagePercent ?? 0,
-      hourlyCost: node.hourlyCost ?? 0,
-      monthlyCost: toMonthlyCost(node.hourlyCost ?? 0)
-    }));
+    return nodes.map((node) => {
+      let hourlyCost = node.hourlyCost ?? 0;
+      let isEstimate = false;
+
+      if (hourlyCost === 0) {
+        hourlyCost = getEstimatedCost(node.instanceType) / 730;
+        isEstimate = true;
+      }
+
+      const monthlyCost = hourlyCost * 730;
+      const cpuAllocatable = node.cpuAllocatableMilli ?? 0;
+
+      const cpuRequestPercent = cpuAllocatable > 0 ? ((node.cpuRequestedMilli ?? 0) / cpuAllocatable) * 100 : 0;
+      const cpuUsage = node.cpuUsagePercent ?? 0;
+
+      // Calculate Memory Stats
+      const memAllocatable = node.memoryAllocatableBytes ?? 0;
+      const memRequestPercent = memAllocatable > 0 ? ((node.memoryRequestedBytes ?? 0) / memAllocatable) * 100 : 0;
+      const memUsage = node.memoryUsagePercent ?? 0;
+
+      // FinOps Waste Calculation: Paying for Request but not Using it (CPU dominant for now, but could blend)
+      const wastePercent = Math.max(0, cpuRequestPercent - cpuUsage);
+      const wasteAmount = monthlyCost * (wastePercent / 100);
+
+      const isEfficient = wastePercent < 15;
+      const isOverProvisioned = wastePercent > 30;
+
+      return {
+        ...node,
+        cpuUsagePercent: cpuUsage,
+        cpuRequestPercent,
+        memoryUsagePercent: memUsage,
+        memRequestPercent,
+        monthlyCost,
+        isEstimate,
+        wastePercent,
+        wasteAmount,
+        isEfficient,
+        isOverProvisioned,
+        shortName: node.nodeName.length > 20 ? node.nodeName.substring(0, 15) + "..." : node.nodeName
+      };
+    });
   }, [nodes]);
 
   const summary = useMemo(() => {
-    const totalMonthly = derivedNodes.reduce((sum, node) => sum + node.monthlyCost, 0);
-    const avgCpu = derivedNodes.length
-      ? derivedNodes.reduce((sum, node) => sum + node.cpuUsagePercent, 0) / derivedNodes.length
-      : 0;
-    const avgMem = derivedNodes.length
-      ? derivedNodes.reduce((sum, node) => sum + node.memoryUsagePercent, 0) / derivedNodes.length
-      : 0;
-    const issueCount = derivedNodes.filter((node) => node.status !== "Ready" || node.isUnderPressure).length;
-    return { totalMonthly, avgCpu, avgMem, ready: derivedNodes.length - issueCount, issues: issueCount };
-  }, [derivedNodes]);
+    const totalMonthly = derivedNodes.reduce((sum, n) => sum + n.monthlyCost, 0);
+    const totalWaste = derivedNodes.reduce((sum, n) => sum + n.wasteAmount, 0);
+    const potentialSavings = totalWaste * 0.6; // Conservative achievable savings
 
-  const filteredNodes = useMemo(() => {
-    const term = search.trim().toLowerCase();
-    if (!term) return derivedNodes;
-    return derivedNodes.filter((node) => node.nodeName.toLowerCase().includes(term));
-  }, [derivedNodes, search]);
+    return { totalMonthly, totalWaste, potentialSavings };
+  }, [derivedNodes]);
 
   const sortedNodes = useMemo(() => {
-    const rows = [...filteredNodes];
-    const valueFor = (node: (typeof derivedNodes)[number]) => {
-      if (sortKey === "cpu") return node.cpuUsagePercent;
-      if (sortKey === "memory") return node.memoryUsagePercent;
-      return node.monthlyCost;
-    };
+    const rows = [...derivedNodes];
     rows.sort((a, b) => {
-      const diff = valueFor(a) - valueFor(b);
-      return sortDirection === "asc" ? diff : -diff;
+      const valA = sortKey === "waste" ? a.wasteAmount : (sortKey === "cost" ? a.monthlyCost : a.wastePercent);
+      const valB = sortKey === "waste" ? b.wasteAmount : (sortKey === "cost" ? b.monthlyCost : b.wastePercent);
+      return sortDirection === "asc" ? valA - valB : valB - valA;
     });
     return rows;
-  }, [filteredNodes, sortKey, sortDirection]);
+  }, [derivedNodes, sortKey, sortDirection]);
 
+  // Sorting Handler
   const handleSort = (key: SortKey) => {
-    if (key === sortKey) {
-      setSortDirection((dir) => (dir === "desc" ? "asc" : "desc"));
-    } else {
-      setSortKey(key);
-      setSortDirection("desc");
-    }
+    if (key === sortKey) setSortDirection(d => d === "desc" ? "asc" : "desc");
+    else { setSortKey(key); setSortDirection("desc"); }
   };
 
-  const optimizationCandidates = useMemo(() => {
-    if (!derivedNodes.length) return [];
-    const sortedCosts = [...derivedNodes].sort((a, b) => b.monthlyCost - a.monthlyCost);
-    const index = Math.max(0, Math.floor(sortedCosts.length * 0.3) - 1);
-    const costThreshold = sortedCosts[index]?.monthlyCost ?? 0;
-    return derivedNodes
-      .filter(
-        (node) =>
-          node.monthlyCost >= costThreshold && node.cpuUsagePercent < 35 && node.memoryUsagePercent < 35
-      )
-      .sort((a, b) => b.monthlyCost - a.monthlyCost)
-      .slice(0, 5);
-  }, [derivedNodes]);
-
-  const alerts = useMemo(() => {
-    return derivedNodes
-      .map((node) => {
-        const reasons: string[] = [];
-        if (node.status !== "Ready") reasons.push(node.status);
-        if (node.cpuUsagePercent >= 85) reasons.push(`CPU ${node.cpuUsagePercent.toFixed(0)}%`);
-        if (node.memoryUsagePercent >= 85) reasons.push(`Memory ${node.memoryUsagePercent.toFixed(0)}%`);
-        if (node.isUnderPressure) reasons.push("Under pressure");
-        return { node, reasons };
-      })
-      .filter((item) => item.reasons.length > 0)
-      .slice(0, 5);
-  }, [derivedNodes]);
-
-  const lastUpdatedLabel = data?.[0]?.lastUpdated ? relativeTimeFromIso(data[0].lastUpdated) : "moments ago";
-
-  const renderSortLabel = (key: SortKey, label: string) => (
-    <button
-      className="flex items-center gap-1 text-left text-xs font-medium uppercase tracking-wide text-muted-foreground"
-      onClick={() => handleSort(key)}
-    >
-      {label}
-      {sortKey === key && <span>{sortDirection === "desc" ? "↓" : "↑"}</span>}
-    </button>
-  );
-
-  if (loading && !data) {
-    return <Skeleton className="h-[70vh] w-full" />;
-  }
-
-  if (error) {
-    return (
-      <Card className="border-destructive/30 bg-destructive/5">
-        <CardContent className="py-10 text-center text-sm text-destructive">{error}</CardContent>
-      </Card>
-    );
-  }
-
-  if (!derivedNodes.length) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>No nodes</CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3 text-sm text-muted-foreground">
-          <p>We couldn’t find any nodes. Once data arrives it will show up here.</p>
-          <Button variant="outline" onClick={refresh} className="w-fit">
-            Refresh
-          </Button>
-        </CardContent>
-      </Card>
-    );
-  }
+  if (loading && !data) return <Skeleton className="h-[80vh] w-full rounded-xl" />;
+  if (error) return <div className="text-red-500 p-10 text-center">Failed to load data: {error}</div>;
 
   return (
-    <div className="space-y-6">
-      <header className="flex flex-wrap items-center justify-between gap-3">
+    <div className="space-y-8 p-1">
+      {/* Header Section */}
+      <div className="flex justify-between items-end border-b border-border/40 pb-6">
         <div>
-          <h1 className="text-2xl font-semibold">Nodes</h1>
-          <p className="text-sm text-muted-foreground">See how much each node costs and how full it is.</p>
+          <h1 className="text-3xl font-bold tracking-tight">Cluster Financials</h1>
+          <p className="text-muted-foreground mt-1">Real-time analysis of infrastructure efficiency and waste.</p>
         </div>
-        <div className="text-sm text-muted-foreground">Last updated {lastUpdatedLabel}</div>
-      </header>
+        <div className="flex gap-3">
+          <Button variant="outline" size="sm" onClick={refresh}>Refresh</Button>
+          <Button size="sm">Download Report</Button>
+        </div>
+      </div>
 
-      <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card>
+      {/* The "Truth" Cards - High Impact Typography */}
+      <div className="grid gap-6 md:grid-cols-3">
+        <Card className="bg-card/50 backdrop-blur-sm shadow-sm md:col-span-1">
           <CardHeader className="pb-2">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">Total node cost</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">Monthly Spend</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-semibold">{formatCurrency(summary.totalMonthly)}</p>
-            <p className="text-xs text-muted-foreground">Monthly (hourly x 30 days)</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">Avg CPU usage</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-2xl font-semibold">{formatPercentage(summary.avgCpu, { fractionDigits: 0 })}</p>
-            <Progress value={summary.avgCpu} className="mt-2" />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">Avg memory usage</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-2xl font-semibold">{formatPercentage(summary.avgMem, { fractionDigits: 0 })}</p>
-            <Progress value={summary.avgMem} className="mt-2" />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs uppercase tracking-wide text-muted-foreground">Node health</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-2xl font-semibold">
-              {summary.ready} Ready · {summary.issues} With issues
+            <div className="text-4xl font-bold tracking-tighter text-foreground">
+              {formatCurrency(summary.totalMonthly)}
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Run rate based on current capacity
             </p>
-            <p className="text-xs text-muted-foreground">Issues = NotReady or under pressure</p>
           </CardContent>
         </Card>
-      </section>
 
-      <section className="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
-        <Card>
-          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <CardTitle>Nodes</CardTitle>
-              <p className="text-sm text-muted-foreground">Sorted by monthly cost</p>
-            </div>
-            <div className="w-full sm:max-w-xs">
-              <Input
-                placeholder="Search nodes"
-                value={search}
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setSearch(event.target.value)}
-                className="h-9 w-full"
-              />
-            </div>
+        <Card className="bg-card/50 backdrop-blur-sm shadow-sm md:col-span-1 border-destructive/20 relative overflow-hidden">
+          <div className="absolute top-0 right-0 p-2">
+            {summary.totalWaste > 0 && (
+              <Badge variant="destructive" className="uppercase text-[10px] tracking-widest font-bold">Action Required</Badge>
+            )}
+          </div>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+              Monthly Waste <AlertTriangleIcon className="w-4 h-4 text-destructive" />
+            </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="hidden lg:block">
-              <div className="overflow-hidden rounded-md border">
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="min-w-[200px]">Node</TableHead>
-                        <TableHead>{renderSortLabel("cost", "Monthly cost")}</TableHead>
-                        <TableHead>{renderSortLabel("cpu", "CPU usage")}</TableHead>
-                        <TableHead>{renderSortLabel("memory", "Memory usage")}</TableHead>
-                        <TableHead>Status</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {sortedNodes.map((node) => (
-                        <TableRow key={node.nodeName} className="cursor-pointer" onClick={() => setSelectedNode(node)}>
-                          <TableCell>
-                            <div className="flex flex-col gap-1">
-                              <span className="font-medium">{node.nodeName}</span>
-                              {node.instanceType && (
-                                <span className="w-fit rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                                  {node.instanceType}
-                                </span>
-                              )}
-                            </div>
-                          </TableCell>
-                          <TableCell className="whitespace-nowrap font-medium">
-                            {formatCurrency(node.monthlyCost)}
-                          </TableCell>
-                          <TableCell className="w-48">
-                            <div className="flex items-center gap-2 text-sm">
-                              <Progress value={node.cpuUsagePercent} className="h-2 flex-1" />
-                              <span className="text-xs text-muted-foreground">{node.cpuUsagePercent.toFixed(0)}%</span>
-                            </div>
-                          </TableCell>
-                          <TableCell className="w-48">
-                            <div className="flex items-center gap-2 text-sm">
-                              <Progress value={node.memoryUsagePercent} className="h-2 flex-1" />
-                              <span className="text-xs text-muted-foreground">{node.memoryUsagePercent.toFixed(0)}%</span>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <Badge className={statusStyles[node.status]} variant="outline">
-                              {node.status}
-                            </Badge>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              </div>
+          <CardContent>
+            <div className={`text-5xl font-extrabold tracking-tighter ${summary.totalWaste > 0 ? "text-destructive" : "text-emerald-500"}`}>
+              {formatCurrency(summary.totalWaste)}
             </div>
-            <div className="space-y-3 lg:hidden">
-              {sortedNodes.map((node) => (
-                <button
-                  key={node.nodeName}
-                  onClick={() => setSelectedNode(node)}
-                  className="w-full rounded-md border border-border/60 p-3 text-left"
-                >
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="font-semibold">{node.nodeName}</p>
-                      {node.instanceType && (
-                        <p className="text-xs text-muted-foreground">{node.instanceType}</p>
-                      )}
-                    </div>
-                    <span className="text-sm font-semibold">{formatCurrency(node.monthlyCost)}</span>
-                  </div>
-                  <div className="mt-2 grid grid-cols-2 gap-3 text-xs text-muted-foreground">
-                    <div>
-                      <p>CPU {node.cpuUsagePercent.toFixed(0)}%</p>
-                      <Progress value={node.cpuUsagePercent} className="mt-1 h-1.5" />
-                    </div>
-                    <div>
-                      <p>Mem {node.memoryUsagePercent.toFixed(0)}%</p>
-                      <Progress value={node.memoryUsagePercent} className="mt-1 h-1.5" />
-                    </div>
-                  </div>
-                  <div className="mt-2 flex items-center gap-2 text-xs">
-                    <Badge className={statusStyles[node.status]} variant="outline">
-                      {node.status}
-                    </Badge>
-                    {node.isUnderPressure && <Badge variant="destructive">Pressure</Badge>}
-                  </div>
-                </button>
-              ))}
-            </div>
+            <p className="text-xs text-muted-foreground mt-2 font-mono">
+              Money burned on unused reservations
+            </p>
           </CardContent>
         </Card>
 
-        <div className="space-y-6">
-          <Card>
-            <CardHeader>
-              <CardTitle>Optimization ideas</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {optimizationCandidates.length === 0 ? (
-                <p className="text-sm text-muted-foreground">Looks good, no obvious wasted nodes right now.</p>
-              ) : (
-                optimizationCandidates.map((node) => (
-                  <div key={node.nodeName} className="rounded border border-border/60 p-3">
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="font-medium">{node.nodeName}</span>
-                      <span>{formatCurrency(node.monthlyCost)}</span>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      {node.cpuUsagePercent.toFixed(0)}% CPU · {node.memoryUsagePercent.toFixed(0)}% Mem
-                    </p>
-                  </div>
-                ))
-              )}
-            </CardContent>
-          </Card>
+        <Card className="bg-card/50 backdrop-blur-sm shadow-sm md:col-span-1 border-emerald-500/20">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">Actionable Savings</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-4xl font-bold tracking-tighter text-emerald-500">
+              {formatCurrency(summary.potentialSavings)}
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Conservative achievable reduction
+            </p>
+          </CardContent>
+        </Card>
+      </div>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Alerts</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {alerts.length === 0 ? (
-                <p className="text-sm text-muted-foreground">All nodes healthy.</p>
-              ) : (
-                alerts.map(({ node, reasons }) => (
-                  <div key={node.nodeName} className="rounded border border-border/60 p-3">
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="font-medium">{node.nodeName}</span>
-                      <Badge variant="destructive">Check</Badge>
-                    </div>
-                    <p className="text-xs text-muted-foreground">{reasons.join(" · ")}</p>
-                  </div>
-                ))
-              )}
-            </CardContent>
-          </Card>
+      {/* FinOps Table - High Density */}
+      <Card className="border-0 shadow-none bg-transparent">
+        <div className="flex flex-col sm:flex-row justify-between items-center mb-4 gap-4">
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="h-6 px-2 text-xs">
+              {sortedNodes.length} Nodes
+            </Badge>
+            {/* Future: Add Filter logic here */}
+          </div>
+          <div className="relative w-full sm:max-w-xs">
+            <SearchIcon className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+            <Input
+              placeholder="Filter by node or instance..."
+              className="pl-8 h-9 bg-background/60"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </div>
         </div>
-      </section>
+
+        <div className="rounded-lg border bg-card/60 overflow-hidden">
+          <Table>
+            <TableHeader className="bg-muted/30">
+              <TableRow className="hover:bg-transparent border-b border-border/50">
+                <TableHead className="w-[200px] font-semibold text-foreground">Node Identity</TableHead>
+                <TableHead className="w-[150px] font-semibold text-foreground cursor-pointer" onClick={() => handleSort("cost")}>
+                  Cost <span className="text-[10px] ml-1 font-normal opacity-50">▼</span>
+                </TableHead>
+                <TableHead className="w-[250px] font-semibold text-foreground">CPU Efficiency</TableHead>
+                <TableHead className="w-[250px] font-semibold text-foreground">Memory Efficiency</TableHead>
+                <TableHead className="text-right pr-6 font-semibold text-foreground cursor-pointer" onClick={() => handleSort("waste")}>Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sortedNodes.filter(n => n.nodeName.includes(search)).map((node) => (
+                <TableRow key={node.nodeName} className="border-b border-border/40 hover:bg-muted/30 transition-colors">
+
+                  {/* Column 1: Identity */}
+                  <TableCell className="py-4 align-top">
+                    <div className="flex flex-col gap-0.5 max-w-[220px]">
+                      <span className="font-bold text-sm text-foreground">{node.instanceType || "Unknown"}</span>
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="text-xs text-muted-foreground font-mono break-all cursor-help opacity-70 hover:opacity-100 leading-tight">
+                              {node.nodeName}
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p className="font-mono text-xs">{node.nodeName}</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </TableCell>
+
+                  {/* Column 2: Cost */}
+                  <TableCell className="py-4 align-top">
+                    <div className="flex flex-col">
+                      <div className="flex items-baseline gap-1">
+                        <span className={`${node.isEstimate ? "text-muted-foreground font-normal" : "font-bold text-foreground"}`}>
+                          {formatCurrency(node.monthlyCost)}
+                        </span>
+                        {node.isEstimate && (
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild><span className="text-[10px] text-amber-500 cursor-help">*</span></TooltipTrigger>
+                              <TooltipContent>Estimated Cost</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        )}
+                      </div>
+                      <span className="text-[10px] text-muted-foreground font-mono">
+                        ${Number(node.hourlyCost.toFixed(4))}/hr
+                      </span>
+                    </div>
+                  </TableCell>
+
+                  {/* Column 3: CPU Efficiency (Stacked) */}
+                  <TableCell className="py-3 align-top">
+                    <EfficiencyBar
+                      usagePercent={node.cpuUsagePercent}
+                      requestPercent={node.cpuRequestPercent}
+                      costPerMonth={node.monthlyCost}
+                    />
+                  </TableCell>
+
+                  {/* Column 4: RAM Efficiency (Stacked) */}
+                  <TableCell className="py-3 align-top">
+                    <EfficiencyBar
+                      usagePercent={node.memoryUsagePercent}
+                      requestPercent={node.memRequestPercent}
+                      costPerMonth={node.monthlyCost}
+                    />
+                  </TableCell>
+
+                  {/* Column 5: Action */}
+                  <TableCell className="py-4 align-top text-right pr-6">
+                    {node.isEfficient ? (
+                      <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-600 border-0">
+                        <CheckCircle2Icon className="w-3 h-3 mr-1" /> Optimized
+                      </Badge>
+                    ) : (
+                      <div className="flex flex-col items-end gap-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className={`h-7 text-xs ${node.wastePercent > 50 ? "border-destructive/50 text-destructive hover:bg-destructive/10" : "border-amber-500/50 text-amber-600 hover:bg-amber-500/10"}`}
+                          onClick={() => setSelectedNode(node)}
+                        >
+                          <ArrowDownIcon className="w-3 h-3 mr-1" />
+                          {node.wastePercent > 50 ? "Fix Waste" : "Rightsize"}
+                        </Button>
+                        <span className="text-[10px] text-muted-foreground font-mono">
+                          Save ~{formatCurrency(node.wasteAmount)}
+                        </span>
+                      </div>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
 
       <NodeDetailSheet
         node={selectedNode}
         open={!!selectedNode}
-        onOpenChange={(open) => {
-          if (!open) {
-            setSelectedNode(null);
-          }
-        }}
+        onOpenChange={(open) => { if (!open) setSelectedNode(null); }}
       />
     </div>
   );

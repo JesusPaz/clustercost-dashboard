@@ -1,6 +1,11 @@
 package store
 
-import "context"
+import (
+	"context"
+	"fmt"
+
+	"github.com/clustercost/clustercost-dashboard/internal/pricing"
+)
 
 // Pricing constants
 const (
@@ -10,51 +15,33 @@ const (
 	CostEgressInternal = 0.00 // Free
 )
 
-// PricingProvider defines the interface for fetching node pricing.
-type PricingProvider interface {
-	GetNodePrice(ctx context.Context, region, instanceType string) (float64, error)
-}
-
 // PricingCatalog allows looking up node prices.
 type PricingCatalog struct {
-	// Map instance type to hourly price
-	InstancePrices map[string]float64
-	Provider       PricingProvider
+	// No provider needed, we use static data from internal/pricing
 }
 
-// NewPricingCatalog returns a catalog with some default mocked pricing.
-func NewPricingCatalog(provider PricingProvider) *PricingCatalog {
-	return &PricingCatalog{
-		InstancePrices: map[string]float64{
-			"t3.medium": 0.0416,
-			"t3.large":  0.0832,
-			"m5.large":  0.096,
-			"m5.xlarge": 0.192,
-			"c5.large":  0.085,
-			"r5.large":  0.126,
-			"default":   0.05, // Fallback
-		},
-		Provider: provider,
-	}
+// NewPricingCatalog returns a catalog.
+func NewPricingCatalog() *PricingCatalog {
+	return &PricingCatalog{}
 }
 
 // GetTotalNodePrice returns the total hourly cost of a node.
 func (pc *PricingCatalog) GetTotalNodePrice(ctx context.Context, region, instanceType string) float64 {
-	// Try Provider first
-	if pc.Provider != nil && instanceType != "" && region != "" {
-		price, err := pc.Provider.GetNodePrice(ctx, region, instanceType)
-		if err == nil && price > 0 {
-			pc.InstancePrices[instanceType] = price // Update cache
-			return price
-		}
+	// 1. Try Shared Static Data
+	key := fmt.Sprintf("%s|%s", region, instanceType)
+	if price, ok := pricing.InstancePrices[key]; ok {
+		return price
 	}
 
-	// Fallback to local cache
-	price, ok := pc.InstancePrices[instanceType]
-	if !ok {
-		price = pc.InstancePrices["default"]
+	// 2. Fallback to generic defaults if completely unknown
+	// check if we have a default for the instance type regardless of region (common for US-East-1 based defaults)
+	// (Optional optimization: try "us-east-1|instanceType" as fallback?)
+	fallbackKey := fmt.Sprintf("us-east-1|%s", instanceType)
+	if price, ok := pricing.InstancePrices[fallbackKey]; ok {
+		return price
 	}
-	return price
+
+	return 0.05 // Ultimate fallback
 }
 
 // GetNodeResourcePrices calculates the cost per vCPU and per GB of RAM based on the instance type.

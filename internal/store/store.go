@@ -11,7 +11,6 @@ import (
 	"math"
 
 	"github.com/clustercost/clustercost-dashboard/internal/config"
-	"github.com/clustercost/clustercost-dashboard/internal/pricing"
 	agentv1 "github.com/clustercost/clustercost-dashboard/internal/proto/agent/v1"
 )
 
@@ -122,6 +121,11 @@ type NodeSummary struct {
 	InstanceType           string            `json:"instanceType,omitempty"`
 	Labels                 map[string]string `json:"labels"`
 	Taints                 []string          `json:"taints"`
+	// Resource Requests (Allocated)
+	CPURequestedMilli    int64 `json:"cpuRequestedMilli"`
+	CPULimitMilli        int64 `json:"cpuLimitMilli"`
+	MemoryRequestedBytes int64 `json:"memoryRequestedBytes"`
+	MemoryLimitBytes     int64 `json:"memoryLimitBytes"`
 	// Network (Host Level)
 	NetTxBytes          int64 `json:"netTxBytes"`
 	NetRxBytes          int64 `json:"netRxBytes"`
@@ -282,6 +286,16 @@ type PodContext struct {
 	InstanceType string
 }
 
+// NodeStats contains historical usage and cost analysis for a node.
+type NodeStats struct {
+	NodeName              string  `json:"nodeName"`
+	P95CPUUsagePercent    float64 `json:"p95CpuUsagePercent"`
+	P95MemoryUsagePercent float64 `json:"p95MemoryUsagePercent"`
+	TotalMonthlyCost      float64 `json:"totalMonthlyCost"`
+	RealUsageMonthlyCost  float64 `json:"realUsageMonthlyCost"`
+	Window                string  `json:"window"`
+}
+
 // New creates a store seeded with agent configurations.
 func New(cfgs []config.AgentConfig, recommendedAgentVersion string) *Store {
 	agentConfigs := make(map[string]config.AgentConfig, len(cfgs))
@@ -290,14 +304,13 @@ func New(cfgs []config.AgentConfig, recommendedAgentVersion string) *Store {
 	}
 
 	// Initialize Static Pricing Provider
-	// Context is just placeholder for interface, static client doesn't need it
-	pricingClient, _ := pricing.NewAWSClient(context.Background())
+	// We use the static map from internal/pricing/data.go, so no dynamic client needed.
 
 	return &Store{
 		agentConfigs:            agentConfigs,
 		snapshots:               make(map[string]*AgentSnapshot, len(cfgs)),
 		recommendedAgentVersion: recommendedAgentVersion,
-		pricing:                 NewPricingCatalog(pricingClient),
+		pricing:                 NewPricingCatalog(),
 	}
 }
 
@@ -972,12 +985,39 @@ func (s *Store) aggregateNodesLocked() (map[string]*NodeSummary, error) {
 		}
 		haveData = true
 
+		// Pre-calculate Pod Limits/Requests per Node
+		nodeLimits := make(map[string]struct {
+			cpuReq, cpuLim, memReq, memLim int64
+		})
+
+		for _, p := range snap.Report.Pods {
+			nodeName := snap.Report.NodeName
+			if nodeName == "" {
+				continue
+			}
+			stats := nodeLimits[nodeName]
+			if p.Cpu != nil {
+				stats.cpuReq += safeInt64(p.Cpu.RequestMillicores)
+				stats.cpuLim += safeInt64(p.Cpu.LimitMillicores)
+			}
+			if p.Memory != nil {
+				stats.memReq += safeInt64(p.Memory.RequestBytes)
+				stats.memLim += safeInt64(p.Memory.LimitBytes)
+			}
+			nodeLimits[nodeName] = stats
+		}
+
 		// Iterate over all nodes reported by this agent
 		for _, n := range snap.Report.Nodes {
 			if n == nil || n.NodeName == "" {
 				continue
 			}
 			name := n.NodeName
+
+			// Use aggregated values from pods if available, fallback to node metric if generic
+			// The Agent V2 NodeMetric.Requested... is arguably the same, but doesn't have Limits.
+			// We prioritize our calculated limits.
+			podStats := nodeLimits[name]
 
 			entry, ok := nodes[name]
 			if !ok {
@@ -988,7 +1028,20 @@ func (s *Store) aggregateNodesLocked() (map[string]*NodeSummary, error) {
 					InstanceType:           "default", // placeholder
 					CPUAllocatableMilli:    safeInt64(n.AllocatableCpuMillicores),
 					MemoryAllocatableBytes: safeInt64(n.AllocatableMemoryBytes),
+					CPURequestedMilli:      safeInt64(n.RequestedCpuMillicores), // Fallback to agent metric
+					CPULimitMilli:          podStats.cpuLim,
+					MemoryRequestedBytes:   safeInt64(n.RequestedMemoryBytes), // Fallback to agent metric
+					MemoryLimitBytes:       podStats.memLim,
+					IsUnderPressure:        n.ThrottlingNs > 1_000_000,
 				}
+				// If agent metric is 0 (older agent?) use our aggregation for Requests too
+				if entry.CPURequestedMilli == 0 {
+					entry.CPURequestedMilli = podStats.cpuReq
+				}
+				if entry.MemoryRequestedBytes == 0 {
+					entry.MemoryRequestedBytes = podStats.memReq
+				}
+
 				nodes[name] = entry
 			}
 
