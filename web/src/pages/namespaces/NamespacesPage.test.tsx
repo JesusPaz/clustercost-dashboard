@@ -11,6 +11,7 @@ vi.mock("../../hooks/useApiData", () => ({
 }));
 
 // Mock ResizeObserver
+// @ts-ignore
 global.ResizeObserver = class ResizeObserver {
   observe() { }
   unobserve() { }

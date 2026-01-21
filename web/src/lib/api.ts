@@ -1,6 +1,9 @@
 import type { Environment } from "./utils";
 
-const API_PREFIX = "/api";
+// Allow overriding the API base via env var (useful for production builds or direct CORS)
+// If VITE_API_URL is set (e.g. "https://api.example.com"), we use that. 
+// Otherwise default to local proxy "/api".
+const API_PREFIX = import.meta.env.VITE_API_URL || "/api";
 
 const normalizeEnvironment = (value?: string): Environment => {
   switch ((value || "").toLowerCase()) {
@@ -110,8 +113,15 @@ export interface NamespacesResponse {
 type NodeCostApi = {
   nodeName: string;
   hourlyCost: number;
+  windowCost: number;
+  activeHours: number;
+  activeRatio: number;
   cpuUsagePercent: number;
   memoryUsagePercent: number;
+  cpuRequestedMilli?: number;
+  cpuLimitMilli?: number;
+  memoryRequestedBytes?: number;
+  memoryLimitBytes?: number;
   cpuAllocatableMilli?: number;
   memoryAllocatableBytes?: number;
   podCount: number;
@@ -331,14 +341,42 @@ export const fetchNamespaces = async (): Promise<NamespacesResponse> => {
   };
 };
 
-export const fetchNodes = async (): Promise<NodeCost[]> => {
-  const resp = await request<NodeListApiResponse>("/cost/nodes");
+export const fetchNodes = async (window?: string): Promise<NodeCost[]> => {
+  const query = window ? `?window=${window}` : "";
+  const resp = await request<NodeListApiResponse>(`/cost/nodes${query}`);
   return resp.items.map((node) => ({
     ...node,
     labels: node.labels ?? {},
     taints: node.taints ?? [],
     lastUpdated: resp.timestamp
   }));
+};
+
+export interface NodeStats {
+  nodeName: string;
+  p95CpuUsagePercent: number;
+  p95MemoryUsagePercent: number;
+  totalMonthlyCost: number;
+  realUsageMonthlyCost: number;
+  window: string;
+}
+
+export const fetchNodeStats = async (name: string, window: string): Promise<NodeStats> => {
+  return request<NodeStats>(`/cost/nodes/${name}/stats?window=${window}`);
+};
+
+export interface PodMetrics {
+  podName: string;
+  namespace: string;
+  qosClass: string;
+  cpuRequestMilli: number;
+  cpuP95Milli: number;
+  memoryRequestBytes: number;
+  memoryP95Bytes: number;
+}
+
+export const fetchNodePods = async (name: string, window: string): Promise<PodMetrics[]> => {
+  return request<PodMetrics[]>(`/cost/nodes/${name}/pods?window=${window}`);
 };
 
 export const fetchResources = async (): Promise<ResourcesSummary> => {

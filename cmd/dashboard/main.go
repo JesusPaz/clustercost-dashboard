@@ -56,6 +56,9 @@ func main() {
 	// Initialize FinOps Engine
 	finopsEngine := finops.NewEngine(vmClient, st.PricingCatalog())
 
+	// Share Pricing Catalog with VM Client
+	vmClient.SetPricingCatalog(st.PricingCatalog())
+
 	auth.SetSecret(cfg.JWTSecret)
 
 	srv := &http.Server{

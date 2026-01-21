@@ -6,7 +6,7 @@ import (
 )
 
 func TestPricingCatalog_GetNodeResourcePrices(t *testing.T) {
-	pc := NewPricingCatalog(nil)
+	pc := NewPricingCatalog()
 
 	// Test case 1: m5.large (2 vCPU, 8GB RAM)
 	// Price: $0.096/hr

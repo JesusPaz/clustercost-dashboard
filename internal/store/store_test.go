@@ -13,7 +13,7 @@ func newTestStore() *Store {
 	}
 	s := New(cfgs, "v1.0.0")
 	// Inject Mock Pricing
-	s.pricing = NewPricingCatalog(&MockPricing{})
+	s.pricing = NewPricingCatalog()
 	return s
 }
 

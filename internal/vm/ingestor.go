@@ -325,7 +325,7 @@ func (i *Ingestor) appendMetricsReport(buf, labelBuf *bytes.Buffer, scratch []by
 	}
 	// map[namespace]*nsAgg
 	nsMap := make(map[string]*nsAgg)
-	pricing := store.NewPricingCatalog(nil)
+	pricing := store.NewPricingCatalog()
 	region := req.Region
 	if region == "" {
 		region = req.AvailabilityZone
@@ -533,6 +533,14 @@ func (i *Ingestor) appendMetricsReport(buf, labelBuf *bytes.Buffer, scratch []by
 			memPct := (float64(node.MemoryUsageBytes) / float64(node.AllocatableMemoryBytes)) * 100
 			writeFloatSample(buf, scratch, "clustercost_node_memory_usage_percent", nodeLabelsBlob, memPct, tsMillis)
 		}
+
+		// Calculate Node Hourly Cost
+		// We use Capacity because you pay for the whole node, not just allocatable.
+		nodeCpuCores := float64(node.CapacityCpuMillicores) / 1000.0
+		nodeMemGB := float64(node.CapacityMemoryBytes) / (1024 * 1024 * 1024)
+		nodeHourlyCost := (nodeCpuCores * cpuPrice) + (nodeMemGB * memPrice)
+
+		writeFloatSample(buf, scratch, "clustercost_node_hourly_cost", nodeLabelsBlob, nodeHourlyCost, tsMillis)
 
 		// Node Network Metrics (Host Traffic)
 		if node.Network != nil {

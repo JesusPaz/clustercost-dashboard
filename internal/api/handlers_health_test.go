@@ -47,6 +47,12 @@ func (f *fakeMetricsProvider) ClusterMetadata(context.Context) (store.ClusterMet
 func (f *fakeMetricsProvider) NetworkTopology(context.Context, store.NetworkTopologyOptions) ([]store.NetworkEdge, error) {
 	return nil, vm.ErrNoData
 }
+func (f *fakeMetricsProvider) GetNodeStats(context.Context, string, string, time.Duration) (store.NodeStats, error) {
+	return store.NodeStats{}, vm.ErrNoData
+}
+func (f *fakeMetricsProvider) GetNodePods(context.Context, string, string, time.Duration) ([]store.PodMetrics, error) {
+	return nil, vm.ErrNoData
+}
 
 func newTestHandler(meta store.ClusterMetadata, status store.AgentStatusPayload) *Handler {
 	return &Handler{vm: &fakeMetricsProvider{meta: meta, status: status}}

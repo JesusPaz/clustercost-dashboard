@@ -15,3 +15,7 @@
 ## Future Considerations
 - [ ] **Retention Policies**: Configure distinct retention periods for high-precision metrics (15s interval) vs. aggregated historical data.
 - [ ] **Refactor Store Locking**: Evaluate moving from heavy `RWMutex` usage in `store.go` to a more concurrent pattern if contention increases with 100+ agents.
+- [ ] **Dynamic Pricing & Savings Plans Support**:
+    - Problem: Agents no longer send costs; backend relies on static On-Demand rates.
+    - Solution: Implement a **Dynamic Pricing Engine** with DB overrides for Savings Plans, Reserved Instances, and Spot Pricing.
+    - Design: See `dynamic_pricing_design.md` artifact.
