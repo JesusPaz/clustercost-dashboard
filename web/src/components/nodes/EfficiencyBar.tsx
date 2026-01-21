@@ -1,4 +1,4 @@
-import { Progress } from "@/components/ui/progress";
+import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "../../lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
@@ -20,17 +20,28 @@ export function EfficiencyBar({
     unit
 }: EfficiencyBarProps) {
     // FinOps Logic:
-    // "High Contrast" Strategy:
+    // "Comfort Zone" Strategy:
     // - Container = Total Node Capacity
     // - Reserved = Light Rail (bg-white/15)
-    // - Usage = Active Bar (Cyan vs Neon Orange)
     // - Threshold = White Line (Always visible on top)
+    // - Logic:
+    //   - < 90% of Reserved: Gap (Cyan)
+    //   - 90% - 110% of Reserved: Optimized (Green Badge, Cyan Bar)
+    //   - > 110% of Reserved: Risk (Orange Bar, Orange Text)
 
-    const isOverLimit = usagePercent > requestPercent;
+    const ratio = requestPercent > 0 ? usagePercent / requestPercent : 0;
+
+    // Logic Refinement (Hybrid Absolute/Relative):
+    // 1. High Risk (Orange): STRICTLY > 110% of reservation (Relative > 1.1).
+    // 2. Optimized (Green): Not High Risk AND Absolute Difference <= 10% (suppress "Gap: 3%" noise).
+    // 3. Gap (Cyan): Everything else (Absolute Difference > 10%).
+
+    const isHighRisk = ratio > 1.1;
+    const diff = Math.abs(usagePercent - requestPercent);
+    const isOptimized = !isHighRisk && diff <= 10;
+
     const wastePercent = Math.max(0, requestPercent - usagePercent);
     const overflowPercent = Math.max(0, usagePercent - requestPercent);
-
-    // Calculate formatted values
     const wastedCost = costPerMonth * (wastePercent / 100);
 
     return (
@@ -43,7 +54,11 @@ export function EfficiencyBar({
                 </span>
 
                 {/* Status Indicator */}
-                {isOverLimit ? (
+                {isOptimized ? (
+                    <Badge variant="outline" className="text-[9px] h-3.5 px-1.5 py-0 border-emerald-500/40 text-emerald-500 bg-emerald-500/5 hover:bg-emerald-500/10 font-sans tracking-wide">
+                        Optimized
+                    </Badge>
+                ) : isHighRisk ? (
                     <span className="text-[10px] text-orange-500 font-bold tracking-tight">
                         Risk: +{overflowPercent.toFixed(0)}%
                     </span>
@@ -71,7 +86,7 @@ export function EfficiencyBar({
                             {/* Layer 2: Actual Usage (The Active Liquid) */}
                             {/* Sits ON TOP of Reserved. */}
                             <div
-                                className={`absolute top-0 left-0 h-full shadow-sm z-10 transition-all duration-500 ${isOverLimit ? "bg-orange-500 shadow-[0_0_12px_rgba(249,115,22,0.6)]" : "bg-cyan-500 shadow-[0_0_8px_rgba(6,182,212,0.6)]"}`}
+                                className={`absolute top-0 left-0 h-full shadow-sm z-10 transition-all duration-500 ${isHighRisk ? "bg-orange-500 shadow-[0_0_12px_rgba(249,115,22,0.6)]" : "bg-cyan-500 shadow-[0_0_8px_rgba(6,182,212,0.6)]"}`}
                                 style={{ width: `${Math.min(usagePercent, 100)}%` }}
                             />
 
@@ -88,11 +103,11 @@ export function EfficiencyBar({
                     <TooltipContent side="bottom" className="text-xs max-w-[200px] bg-slate-950 border-slate-800 font-mono">
                         <div className="space-y-1">
                             <p className="font-semibold border-b border-white/10 pb-1 mb-1 text-slate-200 font-sans">
-                                {isOverLimit ? "Stability Risk" : "Efficiency Gap"}
+                                {isOptimized ? "State: Optimized" : isHighRisk ? "Stability Risk" : "Efficiency Gap"}
                             </p>
                             <div className="flex justify-between gap-4 text-slate-300">
                                 <span>Usage:</span>
-                                <span className={isOverLimit ? "text-orange-400 font-bold" : "text-cyan-400 font-bold"}>
+                                <span className={isHighRisk ? "text-orange-400 font-bold" : "text-cyan-400 font-bold"}>
                                     {usagePercent.toFixed(1)}% ({usageAbsolute.toFixed(2)} {unit})
                                 </span>
                             </div>
@@ -104,10 +119,15 @@ export function EfficiencyBar({
                                 <span>Total:</span>
                                 <span className="text-slate-500">{totalAbsolute.toFixed(1)} {unit}</span>
                             </div>
-                            {!isOverLimit && wastedCost > 1 && (
+                            {!isHighRisk && !isOptimized && wastedCost > 1 && (
                                 <div className="flex justify-between gap-4 pt-1 border-t border-white/10 text-cyan-400 font-bold">
                                     <span>Waste:</span>
                                     <span>{formatCurrency(wastedCost)}/mo</span>
+                                </div>
+                            )}
+                            {isOptimized && (
+                                <div className="pt-1 border-t border-white/10 text-emerald-400 text-[10px] leading-tight mt-1">
+                                    Usage is within 10% of reservation. Perfect balance.
                                 </div>
                             )}
                         </div>
