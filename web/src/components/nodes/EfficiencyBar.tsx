@@ -1,6 +1,7 @@
 import { Badge } from "@/components/ui/badge";
 import { formatCurrency } from "../../lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { AlertTriangle, CheckCircle2, TrendingDown } from "lucide-react";
 
 interface EfficiencyBarProps {
     usagePercent: number;
@@ -100,34 +101,77 @@ export function EfficiencyBar({
                             )}
                         </div>
                     </TooltipTrigger>
-                    <TooltipContent side="bottom" className="text-xs max-w-[200px] bg-slate-950 border-slate-800 font-mono">
-                        <div className="space-y-1">
-                            <p className="font-semibold border-b border-white/10 pb-1 mb-1 text-slate-200 font-sans">
-                                {isOptimized ? "State: Optimized" : isHighRisk ? "Stability Risk" : "Efficiency Gap"}
-                            </p>
-                            <div className="flex justify-between gap-4 text-slate-300">
-                                <span>Usage:</span>
-                                <span className={isHighRisk ? "text-orange-400 font-bold" : "text-cyan-400 font-bold"}>
-                                    {usagePercent.toFixed(1)}% ({usageAbsolute.toFixed(2)} {unit})
-                                </span>
-                            </div>
-                            <div className="flex justify-between gap-4 text-slate-300">
-                                <span>Reserved:</span>
-                                <span className="text-slate-400">{requestPercent.toFixed(1)}%</span>
-                            </div>
-                            <div className="flex justify-between gap-4 text-slate-300">
-                                <span>Total:</span>
-                                <span className="text-slate-500">{totalAbsolute.toFixed(1)} {unit}</span>
-                            </div>
-                            {!isHighRisk && !isOptimized && wastedCost > 1 && (
-                                <div className="flex justify-between gap-4 pt-1 border-t border-white/10 text-cyan-400 font-bold">
-                                    <span>Waste:</span>
-                                    <span>{formatCurrency(wastedCost)}/mo</span>
+
+                    {/* Professional Context Card Tooltip */}
+                    <TooltipContent
+                        side="bottom"
+                        className={`w-[260px] p-0 bg-slate-950/95 backdrop-blur-xl border-2 ${isHighRisk ? 'border-orange-500/50' : isOptimized ? 'border-emerald-500/50' : 'border-cyan-500/50'} shadow-2xl`}
+                    >
+                        <div className="p-3 space-y-3">
+                            {/* Header Section */}
+                            <div className="flex items-start gap-2 border-b border-white/5 pb-2">
+                                {isHighRisk ? (
+                                    <AlertTriangle className="w-4 h-4 text-orange-500 mt-0.5" />
+                                ) : isOptimized ? (
+                                    <CheckCircle2 className="w-4 h-4 text-emerald-500 mt-0.5" />
+                                ) : (
+                                    <TrendingDown className="w-4 h-4 text-cyan-500 mt-0.5" />
+                                )}
+                                <div>
+                                    <p className={`text-sm font-bold ${isHighRisk ? 'text-orange-500' : isOptimized ? 'text-emerald-500' : 'text-cyan-400'}`}>
+                                        {isHighRisk ? "Stability Risk: Bursting" : isOptimized ? "Perfectly Rightsized" : "Efficiency Gap Detected"}
+                                    </p>
+                                    <p className="text-[10px] text-slate-400 leading-tight mt-0.5">
+                                        {isHighRisk
+                                            ? "Operating above guaranteed limits."
+                                            : isOptimized
+                                                ? "Balanced resource utilization."
+                                                : "Resources reserved but unused."}
+                                    </p>
                                 </div>
-                            )}
-                            {isOptimized && (
-                                <div className="pt-1 border-t border-white/10 text-emerald-400 text-[10px] leading-tight mt-1">
-                                    Usage is within 10% of reservation. Perfect balance.
+                            </div>
+
+                            {/* Technical Evidence Section */}
+                            <div className="bg-slate-900/50 rounded p-2 space-y-1 font-mono text-[10px]">
+                                <div className="flex justify-between text-slate-300">
+                                    <span>Usage:</span>
+                                    <span className={isHighRisk ? "text-orange-400 font-bold" : "text-cyan-400 font-bold"}>
+                                        {usagePercent.toFixed(1)}% ({usageAbsolute.toFixed(2)} {unit})
+                                    </span>
+                                </div>
+                                <div className="flex justify-between text-slate-400">
+                                    <span>Reserved:</span>
+                                    <span>{requestPercent.toFixed(1)}% ({((totalAbsolute * requestPercent) / 100 || 0).toFixed(2)} {unit})</span>
+                                </div>
+                            </div>
+
+                            {/* Educational Context Section */}
+                            <div className="text-[11px] text-slate-300 leading-relaxed">
+                                {isHighRisk && (
+                                    <span>
+                                        This node is running at <strong className="text-orange-400">{ratio.toFixed(2)}x</strong> its reservation.
+                                        It relies on unguaranteed burst capacity and is a top candidate for <strong className="text-white bg-red-900/30 px-1 rounded">OOMKill</strong> if cluster pressure increases.
+                                    </span>
+                                )}
+                                {isOptimized && (
+                                    <span>
+                                        Usage is within the <strong className="text-emerald-400">±10% ideal stability window</strong>.
+                                        This configuration maximizes ROI without risking instability. No action required.
+                                    </span>
+                                )}
+                                {!isHighRisk && !isOptimized && (
+                                    <span>
+                                        You are paying for <strong className="text-cyan-400">{(requestPercent - usagePercent).toFixed(0)}%</strong> more capacity than needed.
+                                        This "air gap" provides no technical value and is pure <strong className="text-white border-b border-red-500/50">financial waste</strong>.
+                                    </span>
+                                )}
+                            </div>
+
+                            {/* Financial Impact Footer */}
+                            {!isOptimized && wastedCost > 0.01 && (
+                                <div className="pt-2 border-t border-white/5 flex justify-between items-center">
+                                    <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">Monthly Waste</span>
+                                    <span className="text-xs font-mono font-bold text-red-400">{formatCurrency(wastedCost)}</span>
                                 </div>
                             )}
                         </div>
